@@ -28,15 +28,17 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
     cost = max(1, query_length // 100)
 
     try:
+        # Changed from "deduct_credit" to "deduct_credits" to match your Supabase function
         response = (
             supabase.rpc(
-                "deduct_credit",
+                "deduct_credits",  # ← This is the correct function name from your SQL
                 {"p_user_id": user_id, "p_amount": cost},
             )
             .execute()
         )
     except Exception as e:
         error_msg = str(e)
+        print(f"Credit deduction error: {error_msg}")  # For debugging
         if "INSUFFICIENT_CREDITS" in error_msg:
             raise HTTPException(
                 status_code=402,
@@ -44,7 +46,7 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
             )
         raise HTTPException(
             status_code=500,
-            detail={"error": "Credit check failed. Please try again.", "code": "CREDIT_ERROR"},
+            detail={"error": f"Credit check failed: {error_msg}", "code": "CREDIT_ERROR"},
         )
 
     data = response.data
@@ -60,13 +62,17 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
 
 async def get_balance(user_id: str) -> int:
     supabase = _get_supabase()
-    response = (
-        supabase.table("credit_balances")
-        .select("credits")
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not response.data:
+    try:
+        response = (
+            supabase.table("credit_balances")
+            .select("credits")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+        if not response.data:
+            return 0
+        return response.data["credits"]
+    except Exception as e:
+        print(f"Error getting balance: {e}")
         return 0
-    return response.data["credits"]
