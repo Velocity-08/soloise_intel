@@ -21,7 +21,7 @@ from mangum import Mangum
 
 from stages.dataset_loader import load_dataset, get_dataset_stats
 from pipeline import run_pipeline
-from gateway.auth import validate_api_key
+from gateway.auth import validate_api_key, get_supabase, hash_key
 from gateway.credits import check_and_deduct_credit
 from gateway.logger import log_usage
 from gateway.models import RecommendRequest, RecommendResponse
@@ -159,7 +159,7 @@ async def root():
     }
 
 
-# DEBUG ENDPOINT - Remove after fixing
+# DEBUG ENDPOINTS - Remove after fixing
 @app.post("/debug/test")
 async def debug_test(body: RecommendRequest):
     """Debug endpoint - no auth, full error details"""
@@ -200,6 +200,62 @@ async def debug_env():
         "FIREWORKS_API_KEY": "SET" if os.environ.get("FIREWORKS_API_KEY") else "MISSING",
         "all_env_vars": [k for k in os.environ.keys() if not k.startswith("_")][:20]
     }
+
+
+@app.get("/debug/auth-test")
+async def debug_auth_test():
+    """Test Supabase connection and auth"""
+    results = {}
+    
+    # Test 1: Supabase connection
+    try:
+        supabase = get_supabase()
+        results["supabase_connection"] = "success"
+    except Exception as e:
+        results["supabase_connection"] = f"Failed: {str(e)}"
+    
+    # Test 2: Query api_keys table
+    try:
+        supabase = get_supabase()
+        result = supabase.table("api_keys").select("count").execute()
+        results["api_keys_query"] = f"Success, found {len(result.data)} keys" if result.data else "Success, but no keys"
+    except Exception as e:
+        results["api_keys_query"] = f"Failed: {str(e)}"
+    
+    # Test 3: Find your specific key
+    try:
+        key = "sk-sol-6ea8d0f4730b2bf53d7ed735dbdfee9b8c9b218b"
+        key_hash = hash_key(key)
+        supabase = get_supabase()
+        result = supabase.table("api_keys").select("*").eq("key_hash", key_hash).execute()
+        results["find_key"] = f"Found: {len(result.data) > 0}"
+        if result.data:
+            results["key_user"] = result.data[0]["user_id"]
+            results["key_name"] = result.data[0]["name"]
+            results["key_active"] = result.data[0]["is_active"]
+    except Exception as e:
+        results["find_key"] = f"Failed: {str(e)}"
+    
+    return results
+
+
+@app.get("/debug/check-key/{key}")
+async def debug_check_key(key: str):
+    """Check if a specific API key exists in the database"""
+    try:
+        key_hash = hash_key(key)
+        supabase = get_supabase()
+        
+        result = supabase.table("api_keys").select("*").eq("key_hash", key_hash).execute()
+        
+        return {
+            "key_provided": key[:30] + "..." if len(key) > 30 else key,
+            "hash": key_hash[:30] + "...",
+            "found": len(result.data) > 0,
+            "key_data": result.data[0] if result.data else None
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # ── Mangum handler (Vercel / AWS Lambda adapter) ─────────────────────────────
