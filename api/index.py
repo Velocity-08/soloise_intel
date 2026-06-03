@@ -9,6 +9,7 @@ import time
 import uuid
 import logging
 import asyncio
+import traceback
 
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,7 +83,16 @@ async def recommend(
 
     log.info(f"[{request_id[:8]}] /recommend — user={user_id[:8]}")
 
-    credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
+    try:
+        credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
+    except Exception as e:
+        log.error(f"[{request_id[:8]}] Credit check failed: {str(e)}")
+        return JSONResponse(status_code=402, content={
+            "success": False, 
+            "request_id": request_id,
+            "error": {"type": "credit_error", "message": str(e)},
+            "debug": {"exception": str(e), "type": type(e).__name__}
+        })
 
     try:
         principles = await asyncio.to_thread(
@@ -91,31 +101,21 @@ async def recommend(
             top_n=body.top_n,
             debug=False,
         )
-    except ValueError as e:
+    except Exception as e:
+        error_details = traceback.format_exc()
+        log.error(f"[{request_id[:8]}] Pipeline failed: {str(e)}\n{error_details}")
+        
         asyncio.create_task(log_usage(
             user_id=user_id, key_id=key_id,
             query_length=len(body.query), top_n=body.top_n,
             latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
         ))
-        return JSONResponse(status_code=400, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "validation_error", "message": str(e)},
-        })
-    except RuntimeError as e:
-        asyncio.create_task(log_usage(
-            user_id=user_id, key_id=key_id,
-            query_length=len(body.query), top_n=body.top_n,
-            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
-        ))
-        return JSONResponse(status_code=502, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "upstream_error", "message": str(e)},
-        })
-    except Exception:
-        log.exception(f"[{request_id[:8]}] Unexpected pipeline error")
+        
         return JSONResponse(status_code=500, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "internal_error", "message": "Internal error."},
+            "success": False, 
+            "request_id": request_id,
+            "error": {"type": "pipeline_error", "message": str(e)},
+            "debug": {"exception": str(e), "type": type(e).__name__}
         })
 
     latency_ms = int((time.monotonic() - t_start) * 1000)
@@ -156,6 +156,49 @@ async def root():
             "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
         },
+    }
+
+
+# DEBUG ENDPOINT - Remove after fixing
+@app.post("/debug/test")
+async def debug_test(body: RecommendRequest):
+    """Debug endpoint - no auth, full error details"""
+    try:
+        log.info(f"[DEBUG] Testing pipeline with query: {body.query[:50]}...")
+        
+        principles = await asyncio.to_thread(
+            run_pipeline,
+            raw_input=body.query,
+            top_n=body.top_n,
+            debug=True,
+        )
+        
+        return {
+            "success": True,
+            "count": len(principles),
+            "principles": principles[:2] if principles else [],
+            "message": "Pipeline works! Auth is the issue."
+        }
+    except Exception as e:
+        error_details = traceback.format_exc()
+        log.error(f"[DEBUG] Pipeline failed: {str(e)}\n{error_details}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": error_details,
+            "message": "Pipeline failed. Check the traceback above."
+        }
+
+
+@app.get("/debug/env")
+async def debug_env():
+    """Check environment variables"""
+    return {
+        "SUPABASE_URL": "SET" if os.environ.get("SUPABASE_URL") else "MISSING",
+        "SUPABASE_SERVICE_ROLE_KEY": "SET" if os.environ.get("SUPABASE_SERVICE_ROLE_KEY") else "MISSING",
+        "FIREWORKS_API_KEY": "SET" if os.environ.get("FIREWORKS_API_KEY") else "MISSING",
+        "all_env_vars": [k for k in os.environ.keys() if not k.startswith("_")][:20]
     }
 
 
