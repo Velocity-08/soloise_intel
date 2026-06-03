@@ -8,3 +8,6 @@ venv/
 .venv/
 *.egg-info/
 dist/
+
+.vercel
+.env*
