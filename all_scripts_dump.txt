@@ -1,0 +1,1567 @@
+====================================================================================================
+FILE NAME: script_exporter_backend.py
+PATH: script_exporter_backend.py
+====================================================================================================
+
+import os
+from pathlib import Path
+
+ROOT_DIR = Path(".")
+EXCLUDE_DIRS = {"env", ".git", "__pycache__", "node_modules"}
+
+SCRIPT_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".sh",
+    ".bash",
+    ".ps1",
+    ".java",
+    ".go",
+    ".php",
+    ".rb",
+    ".cs"
+}
+
+
+def extract_scripts(folder_path):
+    results = []
+
+    for root, dirs, files in os.walk(folder_path):
+        # skip virtualenvs, git metadata, and other large folders
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+
+        for file in files:
+            file_path = Path(root) / file
+
+            if file_path.suffix.lower() in SCRIPT_EXTENSIONS:
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+
+                    results.append({
+                        "name": file,
+                        "path": str(file_path),
+                        "code": content
+                    })
+
+                except Exception as e:
+                    results.append({
+                        "name": file,
+                        "path": str(file_path),
+                        "code": f"ERROR READING FILE: {e}"
+                    })
+
+    return results
+
+
+def main():
+    root = ROOT_DIR
+
+    if not root.exists():
+        print(f"Root folder not found: {root}")
+        return
+
+    print(f"\nScanning project root: {root.resolve()}")
+    all_scripts = extract_scripts(root)
+
+    output_file = "all_scripts_dump.txt"
+
+    with open(output_file, "w", encoding="utf-8") as out:
+        for script in all_scripts:
+            out.write("=" * 100 + "\n")
+            out.write(f"FILE NAME: {script['name']}\n")
+            out.write(f"PATH: {script['path']}\n")
+            out.write("=" * 100 + "\n\n")
+            out.write(script["code"])
+            out.write("\n\n\n")
+
+    print(f"\nDone. Extracted {len(all_scripts)} scripts.")
+    print(f"Saved to: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+====================================================================================================
+FILE NAME: index.py
+PATH: api\index.py
+====================================================================================================
+
+"""
+Soloise Intel API — Vercel Entry Point
+FastAPI wrapped with Mangum for serverless deployment.
+"""
+
+import os
+import sys
+import time
+import uuid
+import logging
+import asyncio
+
+# Ensure the api/ directory is on the path so all local modules resolve
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fastapi import FastAPI, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
+
+from stages.dataset_loader import load_dataset, get_dataset_stats
+from pipeline import run_pipeline
+from gateway.auth import validate_api_key
+from gateway.credits import check_and_deduct_credit
+from gateway.logger import log_usage
+from gateway.models import RecommendRequest, RecommendResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+)
+log = logging.getLogger("soloise")
+
+# ── Dataset loaded once at cold start ────────────────────────────────────────
+try:
+    load_dataset()
+    log.info("[BOOT] Dataset loaded into memory")
+except Exception as e:
+    log.error(f"[BOOT] Dataset load failed: {e}")
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Soloise Behavioural Intelligence API",
+    description=(
+        "Send any text, get ranked behavioural principles.\n\n"
+        "**Authentication:** `Authorization: Bearer sk-sol-<your_key>`\n\n"
+        "Get your API key at https://soloise.com/dashboard"
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+@app.post(
+    "/v1/recommend",
+    response_model=RecommendResponse,
+    summary="Get ranked behavioural principles",
+    responses={
+        200: {"description": "Principles returned successfully"},
+        401: {"description": "Invalid or missing API key"},
+        402: {"description": "No credits remaining"},
+        422: {"description": "Invalid request body"},
+        500: {"description": "Internal pipeline error"},
+    },
+)
+async def recommend(
+    body: RecommendRequest,
+    key_row: dict = Depends(validate_api_key),
+):
+    request_id = str(uuid.uuid4())
+    user_id = key_row["user_id"]
+    key_id = key_row["id"]
+    t_start = time.monotonic()
+
+    log.info(f"[{request_id[:8]}] /v1/recommend — user={user_id[:8]}")
+
+    credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
+
+    try:
+        principles = await asyncio.to_thread(
+            run_pipeline,
+            raw_input=body.query,
+            top_n=body.top_n,
+            debug=False,
+        )
+    except ValueError as e:
+        asyncio.create_task(log_usage(
+            user_id=user_id, key_id=key_id,
+            query_length=len(body.query), top_n=body.top_n,
+            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
+        ))
+        return JSONResponse(status_code=400, content={
+            "success": False, "request_id": request_id,
+            "error": {"type": "validation_error", "message": str(e)},
+        })
+    except RuntimeError as e:
+        asyncio.create_task(log_usage(
+            user_id=user_id, key_id=key_id,
+            query_length=len(body.query), top_n=body.top_n,
+            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
+        ))
+        return JSONResponse(status_code=502, content={
+            "success": False, "request_id": request_id,
+            "error": {"type": "upstream_error", "message": str(e)},
+        })
+    except Exception:
+        log.exception(f"[{request_id[:8]}] Unexpected pipeline error")
+        return JSONResponse(status_code=500, content={
+            "success": False, "request_id": request_id,
+            "error": {"type": "internal_error", "message": "Internal error."},
+        })
+
+    latency_ms = int((time.monotonic() - t_start) * 1000)
+    log.info(f"[{request_id[:8]}] Done — {len(principles)} results in {latency_ms}ms")
+
+    asyncio.create_task(log_usage(
+        user_id=user_id, key_id=key_id,
+        query_length=len(body.query), top_n=body.top_n,
+        latency_ms=latency_ms, success=True,
+    ))
+
+    return RecommendResponse(
+        request_id=request_id,
+        results=principles,
+        count=len(principles),
+        credits_used=credits_used,
+        credits_remaining=credits_remaining,
+        latency_ms=latency_ms,
+    )
+
+
+@app.get("/health", summary="Health check")
+async def health():
+    try:
+        stats = get_dataset_stats()
+        return {"status": "ok", "dataset": stats}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "error", "detail": str(e)})
+
+
+@app.get("/", summary="API info", include_in_schema=False)
+async def root():
+    return {
+        "name": "Soloise Behavioural Intelligence API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "POST /v1/recommend": "Get ranked principles. Requires Bearer token.",
+            "GET /health": "Health check + dataset stats.",
+        },
+    }
+
+
+# ── Mangum handler (Vercel / AWS Lambda adapter) ─────────────────────────────
+handler = Mangum(app, lifespan="off")
+
+
+
+====================================================================================================
+FILE NAME: pipeline.py
+PATH: api\pipeline.py
+====================================================================================================
+
+"""
+Pipeline Orchestrator — token-minimized Kimi rerank
+"""
+
+from stages.dataset_loader import load_dataset
+from stages.stage1_normalizer import normalize
+from stages.stage2_intent import extract_intent
+from stages.stage3_prefilter import prefilter
+from stages.stage4_rerank import rerank
+from stages.stage5_extractor import extract
+
+
+def run_pipeline(raw_input: str, top_n: int = 5, debug: bool = False) -> list:
+    dataset = load_dataset()
+
+    stage1 = normalize(raw_input)
+    normalized_text = stage1["normalized_text"]
+    detected_format = stage1["detected_format"]
+
+    if debug:
+        print(f"\n[S1] Format: {detected_format}")
+        print(f"[S1] Text:   {normalized_text[:300]}")
+
+    intent = extract_intent(normalized_text)
+
+    if debug:
+        print("\n[S2] Intent:")
+        for k, v in intent.items():
+            print(f"     {k}: {v}")
+
+    candidates = prefilter(dataset, intent, normalized_text, top_n=16)
+
+    if debug:
+        print(f"\n[S3] Candidates: {len(candidates)}")
+
+    stage4 = rerank(
+        normalized_text=normalized_text,
+        candidates=candidates,
+        dataset=dataset,
+        top_n=top_n,
+    )
+
+    if debug:
+        print(f"\n[S4] Model: {stage4['model']} | Tokens: {stage4['usage']}")
+
+    stage5 = extract(
+        raw_kimi_output=stage4["raw_output"],
+        dataset=dataset,
+        top_n=top_n,
+    )
+
+    if debug:
+        print(f"\n[S5] Principles: {stage5['count']}")
+
+    return stage5["principles"]
+
+
+
+====================================================================================================
+FILE NAME: auth.py
+PATH: api\gateway\auth.py
+====================================================================================================
+
+"""
+Auth — validates the Bearer API key on every request.
+"""
+
+import hashlib
+import os
+from fastapi import HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from supabase import create_client, Client
+
+_supabase: Client | None = None
+
+
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        url = os.environ["SUPABASE_URL"]
+        key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        _supabase = create_client(url, key)
+    return _supabase
+
+
+def hash_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def validate_api_key(
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> dict:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Missing API key. Send: Authorization: Bearer <key>", "code": "MISSING_KEY"},
+        )
+
+    raw_key = credentials.credentials
+
+    if not raw_key.startswith("sk-sol-"):
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Invalid API key format.", "code": "INVALID_KEY_FORMAT"},
+        )
+
+    key_hash = hash_key(raw_key)
+    supabase = get_supabase()
+
+    try:
+        response = (
+            supabase.table("api_keys")
+            .select("id, user_id, is_active")
+            .eq("key_hash", key_hash)
+            .single()
+            .execute()
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Invalid API key.", "code": "INVALID_KEY"},
+        )
+
+    if not response.data:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Invalid API key.", "code": "INVALID_KEY"},
+        )
+
+    if not response.data.get("is_active"):
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "API key is disabled.", "code": "KEY_DISABLED"},
+        )
+
+    return response.data
+
+
+
+====================================================================================================
+FILE NAME: credits.py
+PATH: api\gateway\credits.py
+====================================================================================================
+
+"""
+Credits — check and deduct credits per request.
+"""
+
+import os
+from fastapi import HTTPException
+from supabase import create_client, Client
+
+_supabase: Client | None = None
+
+
+def _get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        _supabase = create_client(
+            os.environ["SUPABASE_URL"],
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+        )
+    return _supabase
+
+
+async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int, int]:
+    """
+    Returns (credits_remaining, credits_used).
+    Raises HTTP 402 if the user has no credits.
+    """
+    supabase = _get_supabase()
+    cost = max(1, query_length // 100)
+
+    try:
+        response = (
+            supabase.rpc(
+                "deduct_credits",
+                {"p_user_id": user_id, "p_amount": cost},
+            )
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Credit check failed. Please try again.", "code": "CREDIT_ERROR"},
+        )
+
+    data = response.data
+    if data is None or (isinstance(data, dict) and data.get("error")):
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "Insufficient credits.", "code": "INSUFFICIENT_CREDITS"},
+        )
+
+    remaining = data if isinstance(data, int) else data.get("credits_remaining", 0)
+    return remaining, cost
+
+
+async def get_balance(user_id: str) -> int:
+    supabase = _get_supabase()
+    response = (
+        supabase.table("credit_balances")
+        .select("credits")
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not response.data:
+        return 0
+    return response.data["credits"]
+
+
+
+====================================================================================================
+FILE NAME: logger.py
+PATH: api\gateway\logger.py
+====================================================================================================
+
+"""
+Logger — async fire-and-forget usage logging to Supabase.
+"""
+
+import logging
+from datetime import datetime, timezone
+from gateway.auth import get_supabase
+
+logger = logging.getLogger("soloise.usage")
+
+
+async def log_usage(
+    user_id: str,
+    key_id: str,
+    query_length: int,
+    top_n: int,
+    latency_ms: int,
+    success: bool = True,
+) -> None:
+    try:
+        supabase = get_supabase()
+        supabase.table("usage_logs").insert({
+            "user_id": user_id,
+            "key_id": key_id,
+            "query_length": query_length,
+            "top_n": top_n,
+            "latency_ms": latency_ms,
+            "success": success,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error(f"Usage logging failed (non-fatal): {e}")
+
+
+
+====================================================================================================
+FILE NAME: models.py
+PATH: api\gateway\models.py
+====================================================================================================
+
+"""
+Gateway Models
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Any
+
+
+class RecommendRequest(BaseModel):
+    query: str = Field(
+        ...,
+        description="Any input: plain text, JSON, CSV, tokens, multi-line. 1–1000 chars.",
+        min_length=1,
+    )
+    top_n: Optional[int] = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of principles to return (1–20). Default: 5.",
+    )
+
+
+class RecommendResponse(BaseModel):
+    success: bool = True
+    request_id: str
+    results: List[Any]
+    count: int
+    credits_used: int
+    credits_remaining: int
+    latency_ms: int
+
+
+class ErrorResponse(BaseModel):
+    success: bool = False
+    error: str
+    code: str
+
+
+
+====================================================================================================
+FILE NAME: __init__.py
+PATH: api\gateway\__init__.py
+====================================================================================================
+
+# gateway package
+
+
+
+====================================================================================================
+FILE NAME: dataset_loader.py
+PATH: api\stages\dataset_loader.py
+====================================================================================================
+
+"""
+Dataset Loader — loads Soloise_Intel_Master_v1.json once into memory.
+On Vercel the JSON must be bundled inside api/ (committed to repo).
+"""
+
+import json
+import os
+
+_dataset_cache = None
+
+
+def load_dataset(path: str = None) -> list:
+    global _dataset_cache
+    if _dataset_cache is not None:
+        return _dataset_cache
+
+    if path is None:
+        # Look for the JSON next to this file (api/stages/) or one level up (api/)
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(here, "Soloise_Intel_Master_v1.json"),
+            os.path.join(here, "..", "Soloise_Intel_Master_v1.json"),
+            os.path.join(here, "..", "..", "Soloise_Intel_Master_v1.json"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                path = p
+                break
+
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(
+            "Dataset not found. Place Soloise_Intel_Master_v1.json inside api/ before deploying."
+        )
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    principles = raw.get("dataset", [])
+    if not principles:
+        raise ValueError("Dataset loaded but 'dataset' key is empty.")
+
+    _dataset_cache = principles
+    return _dataset_cache
+
+
+def get_dataset_stats() -> dict:
+    data = load_dataset()
+    pillars: dict = {}
+    for p in data:
+        pillar = p.get("pillar", "Unknown")
+        pillars[pillar] = pillars.get(pillar, 0) + 1
+    return {"total_principles": len(data), "pillars": pillars}
+
+
+
+====================================================================================================
+FILE NAME: stage1_normalizer.py
+PATH: api\stages\stage1_normalizer.py
+====================================================================================================
+
+"""
+STAGE 1 — Format Detection & Normalization
+"""
+
+import json
+import csv
+import io
+import re
+
+def detect_format(raw_input: str) -> str:
+    stripped = raw_input.strip()
+
+    if (stripped.startswith("{") and stripped.endswith("}")) or \
+       (stripped.startswith("[") and stripped.endswith("]")):
+        try:
+            json.loads(stripped)
+            return "json"
+        except json.JSONDecodeError:
+            pass
+
+    lines = stripped.splitlines()
+    if len(lines) >= 2:
+        first_line = lines[0]
+        comma_count = first_line.count(",")
+        if comma_count >= 1:
+            try:
+                reader = csv.reader(io.StringIO(stripped))
+                rows = list(reader)
+                if len(rows) >= 2 and len(rows[0]) > 1:
+                    return "csv"
+            except Exception:
+                pass
+
+    return "text"
+
+def flatten_json(obj, prefix="") -> list:
+    parts = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            parts.extend(flatten_json(v, prefix=f"{k}"))
+    elif isinstance(obj, list):
+        for item in obj:
+            parts.extend(flatten_json(item, prefix=prefix))
+    else:
+        val = str(obj).strip()
+        if val and val.lower() not in ("none", "null", ""):
+            if prefix:
+                parts.append(f"{prefix}: {val}")
+            else:
+                parts.append(val)
+    return parts
+
+def normalize_json(raw: str) -> str:
+    parsed = json.loads(raw.strip())
+    parts = flatten_json(parsed)
+    return ". ".join(parts)
+
+def normalize_csv(raw: str) -> str:
+    reader = csv.DictReader(io.StringIO(raw.strip()))
+    sentences = []
+    for row in reader:
+        parts = [f"{k.strip()}: {v.strip()}" for k, v in row.items() if v.strip()]
+        if parts:
+            sentences.append(", ".join(parts))
+    return ". ".join(sentences)
+
+def normalize_text(raw: str) -> str:
+    lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+    if len(lines) <= 5:
+        return " ".join(lines)
+
+    action_verbs = r"\b(increase|reduce|improve|fix|convert|grow|retain|onboard|signup|cancel|churn|engage|activate|launch|test|optimize|write|build|design)\b"
+    key_lines = [lines[0]]
+    if lines[-1] != lines[0]:
+        key_lines.append(lines[-1])
+
+    for line in lines[1:-1]:
+        if "?" in line or re.search(action_verbs, line, re.IGNORECASE):
+            key_lines.append(line)
+        if len(key_lines) >= 7:
+            break
+
+    return " ".join(key_lines)
+
+def normalize(raw_input: str) -> dict:
+    if not raw_input or not raw_input.strip():
+        raise ValueError("Empty input received.")
+
+    fmt = detect_format(raw_input)
+
+    if fmt == "json":
+        text = normalize_json(raw_input)
+    elif fmt == "csv":
+        text = normalize_csv(raw_input)
+    else:
+        text = normalize_text(raw_input)
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return {"normalized_text": text, "detected_format": fmt}
+
+
+
+====================================================================================================
+FILE NAME: stage2_intent.py
+PATH: api\stages\stage2_intent.py
+====================================================================================================
+
+"""
+STAGE 2 — Intent Extraction
+"""
+
+import re
+
+GOAL_SIGNALS = {
+    "increase CTR": ["ctr", "click", "click-through", "clickthrough", "clicks"],
+    "improve conversion": ["conversion", "convert", "converting", "sales", "purchase"],
+    "reduce churn": ["churn", "cancel", "cancellation", "retention", "retain", "winback", "win-back"],
+    "reduce friction": ["friction", "drop-off", "dropoff", "abandon", "abandonment", "bounce"],
+    "improve completion": ["complete", "completion", "finish", "onboard", "onboarding", "activate", "activation"],
+    "create urgency": ["urgency", "urgent", "scarcity", "limited", "deadline", "expire", "fomo"],
+    "increase trust": ["trust", "credibility", "proof", "testimonial", "authority", "social proof"],
+    "boost engagement": ["engage", "engagement", "sticky", "daily active", "dau", "habit", "notification"],
+    "increase revenue": ["revenue", "upsell", "upgrade", "pricing", "monetize", "monetization", "mrr", "arr"],
+    "grow signups": ["signup", "sign up", "register", "registration", "trial", "free trial"],
+    "improve retention": ["retention", "retain", "churn", "loyal", "loyalty", "renew", "renewal"],
+    "increase awareness": ["awareness", "brand", "recall", "impression", "reach"],
+}
+
+PAGE_TYPE_SIGNALS = {
+    "hero": ["hero", "homepage", "home page", "above the fold", "landing"],
+    "pricing": ["pricing", "price", "plan", "tier", "cost", "affordable"],
+    "signup": ["signup", "sign up", "register", "registration form", "create account"],
+    "onboarding": ["onboarding", "onboard", "setup", "getting started", "welcome", "activate"],
+    "email": ["email", "subject line", "newsletter", "drip", "nurture", "campaign", "inbox"],
+    "landing page": ["landing page", "ad landing", "paid traffic", "squeeze page"],
+    "dashboard": ["dashboard", "app", "product", "in-app", "inside the product"],
+    "checkout": ["checkout", "payment", "billing", "upgrade flow", "purchase flow"],
+    "cancellation": ["cancel", "cancellation", "churn flow", "offboarding"],
+    "testimonial": ["testimonial", "case study", "review", "proof section", "social proof"],
+    "ad": ["ad", "advertisement", "creative", "banner", "paid social", "facebook ad", "google ad"],
+}
+
+FUNNEL_STAGE_SIGNALS = {
+    "awareness": ["awareness", "brand", "reach", "impression", "top of funnel", "tofu", "discovery"],
+    "consideration": ["consideration", "compare", "alternative", "research", "evaluate", "shortlist"],
+    "conversion": ["conversion", "convert", "buy", "purchase", "close", "sign up", "commit"],
+    "activation": ["activation", "activate", "first value", "aha moment", "onboard", "setup"],
+    "retention": ["retention", "retain", "keep", "churn", "renew", "loyalty", "habit"],
+    "expansion": ["expand", "upsell", "upgrade", "cross-sell", "grow account", "revenue expansion"],
+    "winback": ["winback", "win back", "re-engage", "reactivate", "lapsed", "churned"],
+}
+
+AUDIENCE_SIGNALS = {
+    "B2B buyers": ["b2b", "business to business", "buyer", "procurement", "stakeholder", "decision maker"],
+    "enterprise buyer": ["enterprise", "large company", "fortune 500", "big company", "corporate", "cto", "ciso"],
+    "founder-led SaaS": ["founder", "startup", "bootstrapped", "indie", "solopreneur", "early stage"],
+    "SMB": ["smb", "small business", "small team", "mid-market", "midmarket", "growing company"],
+    "B2C": ["b2c", "consumer", "individual user", "end user", "personal"],
+    "PLG": ["plg", "product led", "product-led growth", "self-serve", "freemium"],
+}
+
+TONE_SIGNALS = {
+    "direct": ["direct", "clear", "straightforward", "no-nonsense", "concise"],
+    "bold": ["bold", "aggressive", "strong", "powerful", "punchy"],
+    "emotional": ["emotional", "empathy", "feeling", "fear", "desire", "pain", "hope"],
+    "analytical": ["data", "analytics", "metric", "stats", "numbers", "roi", "analytical"],
+    "playful": ["playful", "fun", "humor", "witty", "quirky", "creative"],
+    "trustworthy": ["trust", "reliable", "credible", "safe", "secure", "honest"],
+}
+
+BUSINESS_STAGE_SIGNALS = {
+    "acquisition": [
+        "cold traffic", "paid ads", "facebook ad", "google ad", "landing page", "hero section",
+        "first visit", "new visitor", "ad creative", "top of funnel", "awareness", "discovery",
+        "brand awareness", "reach", "impression", "ctr", "click through"
+    ],
+    "activation": [
+        "onboarding", "activate", "first value", "aha moment", "getting started", "setup",
+        "first login", "day one", "day 1", "new user", "first session", "welcome email",
+        "never used", "signed up but", "ghost", "not using", "didn't come back"
+    ],
+    "monetization": [
+        "upgrade", "free to paid", "freemium", "won't pay", "won't upgrade", "paid plan",
+        "trial to paid", "trial conversion", "pricing page", "upgrade prompt", "upgrade cta",
+        "paid tier", "subscription", "payment", "checkout", "willingness to pay",
+        "free users", "free plan", "upgrade flow", "convert to paid", "monetize"
+    ],
+    "retention": [
+        "churn", "cancel", "cancellation", "retain", "retention", "renewal", "renew",
+        "keeping users", "users leaving", "drop off after", "stop using", "inactive",
+        "lapsed", "disengaged", "win back", "reactivate", "loyalty", "long term"
+    ],
+    "expansion": [
+        "upsell", "cross-sell", "expand", "grow account", "increase revenue per user",
+        "power user", "heavy user", "seat expansion", "plan upgrade", "enterprise upgrade",
+        "add seats", "additional features", "mrr expansion", "account growth"
+    ],
+    "resurrection": [
+        "churned user", "lost customer", "win back", "re-engage", "reactivate",
+        "lapsed user", "came back", "return", "re-subscribe", "dormant"
+    ],
+}
+
+EMOTIONAL_MECHANISM_SIGNALS = {
+    "trust": ["trust", "credibility", "skeptical", "skepticism", "doubt", "believe", "safe", "secure", "legitimate", "scam", "fake", "real", "verified"],
+    "uncertainty": ["not sure", "unsure", "confused", "confusing", "unclear", "don't know", "hesitant", "hesitation", "risky", "risk", "afraid", "worry", "concerned"],
+    "effort": ["too hard", "complicated", "complex", "difficult", "friction", "drop off", "abandon", "give up", "form", "fields", "steps", "long", "tedious"],
+    "loss": ["losing", "lose", "lost", "missing out", "leaving money", "cost", "wasting", "waste", "leaking", "leak", "bleeding", "gap", "hole"],
+    "identity": ["belong", "like me", "for people like", "status", "brand", "image", "identity", "community", "tribe", "peer", "role", "professional"],
+    "inertia": ["stuck", "comfortable", "habit", "routine", "don't want to change", "not motivated", "no urgency", "no reason", "procrastinate", "later", "won't pay", "won't upgrade", "doing nothing", "staying on free"],
+    "overwhelm": ["too much", "overwhelmed", "overload", "too many", "too many options", "don't know where to start", "cognitive", "cluttered", "busy", "noisy"],
+    "anxiety": ["anxious", "anxiety", "scared", "fear", "panic", "stress", "nervous", "payment", "credit card", "billing", "charge", "cancel", "locked in"],
+}
+
+def _match_signals(text_lower: str, signal_map: dict) -> list:
+    matched = []
+    for category, keywords in signal_map.items():
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                matched.append(category)
+                break
+    return matched
+
+def _classify_business_stage(text_lower: str) -> list:
+    scores = {}
+    for stage, keywords in BUSINESS_STAGE_SIGNALS.items():
+        score = 0
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                score += 1
+        if score > 0:
+            scores[stage] = score
+    return sorted(scores, key=scores.get, reverse=True)
+
+def _classify_emotional_mechanism(text_lower: str) -> list:
+    scores = {}
+    for mechanism, keywords in EMOTIONAL_MECHANISM_SIGNALS.items():
+        score = 0
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                score += 1
+        if score > 0:
+            scores[mechanism] = score
+    return sorted(scores, key=scores.get, reverse=True)
+
+def extract_intent(normalized_text: str) -> dict:
+    text_lower = normalized_text.lower()
+
+    goals = _match_signals(text_lower, GOAL_SIGNALS)
+    page_types = _match_signals(text_lower, PAGE_TYPE_SIGNALS)
+    funnel = _match_signals(text_lower, FUNNEL_STAGE_SIGNALS)
+    audiences = _match_signals(text_lower, AUDIENCE_SIGNALS)
+    tones = _match_signals(text_lower, TONE_SIGNALS)
+    business_stages = _classify_business_stage(text_lower)
+    emotional_mechs = _classify_emotional_mechanism(text_lower)
+
+    return {
+        "goals": goals,
+        "page_types": page_types,
+        "funnel_stages": funnel,
+        "audiences": audiences,
+        "tone_fit": tones,
+        "business_stages": business_stages,
+        "emotional_mechanisms": emotional_mechs,
+    }
+
+
+
+====================================================================================================
+FILE NAME: stage3_prefilter.py
+PATH: api\stages\stage3_prefilter.py
+====================================================================================================
+
+"""
+STAGE 3 — Keyword Pre-filter
+"""
+
+import re
+
+STAGE_TO_FUNNEL = {
+    "acquisition": ["awareness", "consideration"],
+    "activation": ["activation"],
+    "monetization": ["conversion"],
+    "retention": ["retention"],
+    "expansion": ["expansion"],
+    "resurrection": ["winback"],
+}
+
+STAGE_KEYWORDS = {
+    "acquisition": ["cold traffic", "ad copy", "hero", "first visit", "landing page"],
+    "activation": ["onboarding", "activation", "first value", "aha moment", "day 1"],
+    "monetization": ["upgrade", "free to paid", "trial to paid", "pricing", "checkout", "freemium", "upgrade prompt", "willingness to pay", "paid plan"],
+    "retention": ["churn", "retention", "renewal", "cancel", "win back", "loyalty"],
+    "expansion": ["upsell", "expansion", "seat", "power user", "account growth"],
+    "resurrection": ["win back", "reactivate", "lapsed", "churned", "re-engage"],
+}
+
+EMOTION_KEYWORDS = {
+    "trust": ["trust", "credibility", "social proof", "authority", "verification"],
+    "uncertainty": ["risk reversal", "guarantee", "clarity", "reassurance", "objection"],
+    "effort": ["friction", "cognitive load", "form", "simplification", "ease"],
+    "loss": ["loss aversion", "scarcity", "urgency", "fomo", "cost of inaction"],
+    "identity": ["identity", "status", "community", "belonging", "social"],
+    "inertia": ["commitment", "trigger", "nudge", "upgrade prompt", "activation"],
+    "overwhelm": ["cognitive load", "simplification", "clarity", "focus", "hierarchy"],
+    "anxiety": ["risk reversal", "trust", "security", "guarantee", "transparency"],
+}
+
+def _overlap_score(query_values: list, principle_values: list) -> int:
+    if not query_values or not principle_values:
+        return 0
+    q_lower = [v.lower() for v in query_values]
+    p_lower = [v.lower() for v in principle_values]
+    return sum(1 for q in q_lower if any(q in p or p in q for p in p_lower))
+
+def _keyword_text_match(normalized_text: str, principle: dict) -> int:
+    tags = principle.get("metadata_tags", {})
+    use_case_keywords = tags.get("use_case_keywords", [])
+    text_lower = normalized_text.lower()
+    score = 0
+    for kw in use_case_keywords:
+        if re.search(r"\b" + re.escape(kw.lower()) + r"\b", text_lower):
+            score += 2
+    return score
+
+def _business_stage_score(principle: dict, business_stages: list) -> int:
+    if not business_stages:
+        return 0
+
+    tags = principle.get("metadata_tags", {})
+    p_funnel = [v.lower() for v in tags.get("funnel_stages", [])]
+    p_keywords = [v.lower() for v in tags.get("use_case_keywords", [])]
+
+    score = 0
+    for i, stage in enumerate(business_stages[:3]):
+        weight = 4 if i == 0 else 2
+
+        target_funnels = STAGE_TO_FUNNEL.get(stage, [])
+        for tf in target_funnels:
+            if any(tf in pf for pf in p_funnel):
+                score += weight
+
+        stage_kws = STAGE_KEYWORDS.get(stage, [])
+        for skw in stage_kws:
+            if any(skw in pk for pk in p_keywords):
+                score += weight
+
+    return score
+
+def _emotional_mechanism_score(principle: dict, emotional_mechs: list) -> int:
+    if not emotional_mechs:
+        return 0
+
+    tags = principle.get("metadata_tags", {})
+    p_keywords = [v.lower() for v in tags.get("use_case_keywords", [])]
+    p_text = (
+        principle.get("principle_name", "") + " " +
+        principle.get("one_liner", "") + " " +
+        principle.get("human_fear_or_desire", "")
+    ).lower()
+
+    score = 0
+
+    for i, mech in enumerate(emotional_mechs[:3]):
+        weight = 3 if i == 0 else 1
+
+        mech_kws = EMOTION_KEYWORDS.get(mech, [])
+        for mkw in mech_kws:
+            if mkw in p_text or any(mkw in pk for pk in p_keywords):
+                score += weight
+                break
+
+    return score
+
+def score_principle(principle: dict, intent: dict, normalized_text: str) -> int:
+    tags = principle.get("metadata_tags", {})
+    score = 0
+
+    score += _overlap_score(intent.get("goals", []), tags.get("goals", []))
+    score += _overlap_score(intent.get("page_types", []), tags.get("page_types", []))
+    score += _overlap_score(intent.get("funnel_stages", []), tags.get("funnel_stages", []))
+    score += _overlap_score(intent.get("audiences", []), tags.get("audiences", []))
+    score += _overlap_score(intent.get("tone_fit", []), tags.get("tone_fit", []))
+
+    score += _keyword_text_match(normalized_text, principle)
+    score += _business_stage_score(principle, intent.get("business_stages", []))
+    score += _emotional_mechanism_score(principle, intent.get("emotional_mechanisms", []))
+
+    name = principle.get("principle_name", "").lower()
+    one_liner = principle.get("one_liner", "").lower()
+    text_lower = normalized_text.lower()
+    if name and name in text_lower:
+        score += 3
+    if one_liner:
+        first_words = " ".join(one_liner.split()[:4])
+        if first_words in text_lower:
+            score += 2
+
+    return score
+
+def prefilter(dataset: list, intent: dict, normalized_text: str, top_n: int = 20) -> list:
+    scored = []
+    for principle in dataset:
+        s = score_principle(principle, intent, normalized_text)
+        scored.append((s, principle))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    has_matches = any(s > 0 for s, _ in scored)
+
+    if not has_matches:
+        return dataset
+
+    return [p for s, p in scored[:top_n]]
+
+def get_score_summary(dataset: list, intent: dict, normalized_text: str) -> list:
+    scored = []
+    for principle in dataset:
+        s = score_principle(principle, intent, normalized_text)
+        scored.append({
+            "id": principle.get("id"),
+            "name": principle.get("principle_name"),
+            "score": s,
+            "pillar": principle.get("pillar_code"),
+        })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:20]
+
+
+
+====================================================================================================
+FILE NAME: stage4_rerank.py
+PATH: api\stages\stage4_rerank.py
+====================================================================================================
+
+"""
+STAGE 4 — Kimi K2.5 Semantic Re-rank via Fireworks AI
+Minimized-output version.
+
+Goals:
+- Reduce completion tokens as much as possible.
+- Keep only the 5 ranked principle IDs.
+- Avoid breaking the pipeline if Fireworks rejects structured output.
+
+Behavior:
+- Primary path: structured JSON schema request (no reasoning output).
+- Fallback path: plain JSON-only request if Fireworks returns 400/422.
+- Final normalized output is always a bare JSON array string, so Stage 5
+  can keep working unchanged.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
+FIREWORKS_API_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
+MODEL = "accounts/fireworks/models/kimi-k2p5"
+
+# Keep this short. The model only needs to choose IDs.
+SYSTEM_PROMPT = (
+    "You are a ranking engine. "
+    "Return only the requested JSON. "
+    "Do not explain your reasoning. "
+    "Do not add markdown."
+)
+
+
+def _build_response_format() -> dict[str, Any]:
+    """
+    Fireworks structured output request.
+
+    The docs say:
+    - response_format can be {"type": "json_schema", "json_schema": {...}}
+    - using json_schema disables reasoning output
+    - schema should be included in the prompt too for best results
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "RankedIds",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "description": "Principle ID such as P1-001"
+                        },
+                        "description": "Ranked principle IDs, best to worst."
+                    }
+                },
+                "required": ["ids"],
+                "additionalProperties": False
+            }
+        }
+    }
+
+
+def build_user_message(normalized_text: str, candidates: list, top_n: int) -> str:
+    """
+    Keep prompt compact. The reranker only needs lightweight descriptors.
+    """
+    compact_candidates = []
+    for p in candidates:
+        tags = p.get("metadata_tags", {})
+        compact_candidates.append(
+            {
+                "id": p.get("id"),
+                "principle_name": p.get("principle_name"),
+                "one_liner": p.get("one_liner"),
+                "use_case_keywords": tags.get("use_case_keywords", [])[:8],
+                "funnel_stages": tags.get("funnel_stages", [])[:4],
+                "goals": tags.get("goals", [])[:4],
+            }
+        )
+
+    candidates_json = json.dumps(compact_candidates, ensure_ascii=False)
+
+    return (
+        f'User query:\n"""{normalized_text}"""\n\n'
+        f"Candidate principles ({len(candidates)} total):\n"
+        f"{candidates_json}\n\n"
+        "Select the best principles for the query.\n"
+        f"Return exactly {top_n} ranked IDs as JSON in this exact shape:\n"
+        f'{{"ids":["P1-001","P1-002","P1-003","P1-004","P1-005"]}}\n'
+        "No extra keys. No explanation. No markdown."
+    )
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _extract_ordered_ids(text: str) -> list[str]:
+    all_ids = re.findall(r"P\d+-\d+", text)
+    return _dedupe_preserve_order(all_ids)
+
+
+def _normalize_model_output(raw_output: str, top_n: int) -> str:
+    """
+    Convert any acceptable model output into a bare JSON array string.
+    Stage 5 already understands JSON lists, so this keeps the pipeline stable.
+    """
+    text = (raw_output or "").strip()
+
+    # Remove code fences if the model wrapped the JSON.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    # 1) Try direct JSON parse.
+    try:
+        parsed = json.loads(text)
+
+        # {"ids": [...]} -> [...]
+        if isinstance(parsed, dict) and isinstance(parsed.get("ids"), list):
+            ids = [str(x) for x in parsed["ids"]]
+            ids = [x for x in ids if re.fullmatch(r"P\d+-\d+", x)]
+            ids = _dedupe_preserve_order(ids)
+            return json.dumps(ids[:top_n])
+
+        # [...] -> [...]
+        if isinstance(parsed, list):
+            ids = [str(x) for x in parsed]
+            ids = [x for x in ids if re.fullmatch(r"P\d+-\d+", x)]
+            ids = _dedupe_preserve_order(ids)
+            return json.dumps(ids[:top_n])
+
+    except Exception:
+        pass
+
+    # 2) Try FINAL RANKING line.
+    final_match = re.search(
+        r"FINAL RANKING[:\s]*(\[[^\]]*\])",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if final_match:
+        try:
+            parsed = json.loads(final_match.group(1))
+            if isinstance(parsed, list):
+                ids = [str(x) for x in parsed if re.fullmatch(r"P\d+-\d+", str(x))]
+                ids = _dedupe_preserve_order(ids)
+                if ids:
+                    return json.dumps(ids[:top_n])
+        except Exception:
+            pass
+
+    # 3) Last resort: regex extraction.
+    ids = _extract_ordered_ids(text)
+    return json.dumps(ids[:top_n])
+
+
+def _post_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            FIREWORKS_API_URL,
+            json=payload,
+            headers=headers,
+        )
+
+    if response.status_code >= 400:
+        # Include the response body in the exception so you can see the exact issue.
+        raise RuntimeError(
+            f"Fireworks request failed: HTTP {response.status_code} — {response.text}"
+        )
+
+    return response.json()
+
+
+def rerank(
+    normalized_text: str,
+    candidates: list,
+    dataset: list,  # kept for compatibility with existing pipeline signature
+    top_n: int = 5,
+) -> dict:
+    """
+    Stage 4 rerank.
+
+    Returns:
+        {
+            "raw_output": "<JSON array string>",
+            "candidates_sent": int,
+            "model": str,
+            "latency_ms": int,
+            "usage": {...}
+        }
+    """
+    if not FIREWORKS_API_KEY:
+        raise ValueError(
+            "FIREWORKS_API_KEY not found in environment. Check your .env file."
+        )
+
+    user_message = build_user_message(normalized_text, candidates, top_n)
+
+    base_payload: dict[str, Any] = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        # Very small output budget: we only need 5 IDs.
+        "max_completion_tokens": 80,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n": 1,
+        "stream": False,
+        "raw_output": False,
+        "perf_metrics_in_response": False,
+    }
+
+    # Primary path: structured output.
+    structured_payload = dict(base_payload)
+    structured_payload["response_format"] = _build_response_format()
+
+    print("\n" + "=" * 80)
+    print("[STAGE 4] Sending request to Kimi")
+    print(f"[STAGE 4] Model: {MODEL}")
+    print(f"[STAGE 4] Candidates: {len(candidates)}")
+    print(f"[STAGE 4] top_n: {top_n}")
+    print("=" * 80)
+
+    start_time = time.time()
+    data: dict[str, Any] | None = None
+    used_fallback = False
+
+    try:
+        data = _post_chat_completion(structured_payload)
+    except RuntimeError as e:
+        err_text = str(e)
+
+        # If Fireworks dislikes structured output on this model/config,
+        # retry once without response_format but still keep the prompt strict.
+        if "HTTP 400" in err_text or "HTTP 422" in err_text:
+            print("[STAGE 4] Structured output rejected. Retrying without response_format...")
+            used_fallback = True
+            data = _post_chat_completion(base_payload)
+        else:
+            print("\n" + "=" * 80)
+            print("[STAGE 4 ERROR]")
+            print(err_text)
+            print("=" * 80)
+            raise RuntimeError(f"Stage 4 Kimi request failed: {err_text}") from e
+
+    elapsed = round((time.time() - start_time) * 1000)
+
+    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+    print("\n" + "=" * 80)
+    print("[KIMI TOKEN USAGE]")
+    print(json.dumps(usage, indent=2))
+    print("=" * 80)
+
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+
+    print(
+        f"[TOKENS] prompt={prompt_tokens} "
+        f"completion={completion_tokens} "
+        f"total={total_tokens}"
+    )
+
+    try:
+        message = data["choices"][0]["message"]
+        raw_content = message.get("content", "") or ""
+
+        # Some reasoning models expose thinking separately. We ignore it.
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content:
+            print("[STAGE 4] reasoning_content was returned separately and ignored.")
+
+        raw_output = _normalize_model_output(raw_content, top_n)
+
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("[STAGE 4 ERROR]")
+        print(f"Could not parse Fireworks response: {e}")
+        print(json.dumps(data, indent=2)[:4000])
+        print("=" * 80)
+        raise RuntimeError("Stage 4 response parsing failed.") from e
+
+    print("\n" + "=" * 80)
+    print("[NORMALIZED KIMI OUTPUT]")
+    print(raw_output)
+    print("=" * 80)
+
+    print(
+        f"[STAGE 4] Complete | "
+        f"Latency={elapsed}ms | "
+        f"Chars={len(raw_output)} | "
+        f"Fallback={'yes' if used_fallback else 'no'}"
+    )
+
+    return {
+        "raw_output": raw_output,
+        "candidates_sent": len(candidates),
+        "model": MODEL,
+        "latency_ms": elapsed,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+
+====================================================================================================
+FILE NAME: stage5_extractor.py
+PATH: api\stages\stage5_extractor.py
+====================================================================================================
+
+"""
+STAGE 5 — Principle Extractor, Field Filter & Diversity Re-ranker
+"""
+
+import re
+import json
+
+ALLOWED_FIELDS = [
+    "id",
+    "pillar",
+    "pillar_code",
+    "principle_name",
+    "one_liner",
+    "plain_english",
+    "human_fear_or_desire",
+    "when_to_use",
+    "when_NOT_to_use",
+    "saas_example",
+    "exact_implementation",
+    "example_copy",
+    "power_level",
+    "ethical_risk",
+    "combines_well_with",
+]
+
+SIMILARITY_GROUPS = [
+    {"P3-008", "P5-001", "P5-013"},
+    {"P5-005", "P5-014", "P5-010", "P5-017"},
+    {"P2-001", "P2-002", "P2-003", "P2-010"},
+    {"P3-009", "P6-012"},
+    {"P4-005", "P1-003"},
+    {"P4-001", "P4-002", "P4-007"},
+]
+
+def extract_ids_from_kimi(raw_output: str, top_n: int) -> list:
+    text = raw_output.strip()
+    text = re.sub(r"```(?:json)?", "", text).strip()
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("ids"), list):
+            ids = [str(i) for i in parsed["ids"] if re.match(r"P\d+-\d+", str(i))]
+            if ids:
+                return ids[:top_n * 2]
+        if isinstance(parsed, list):
+            ids = [str(i) for i in parsed if re.match(r"P\d+-\d+", str(i))]
+            if ids:
+                return ids[:top_n * 2]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    final_match = re.search(r'FINAL RANKING[:\s]*(\[.*?\])', text, re.DOTALL | re.IGNORECASE)
+    if final_match:
+        try:
+            parsed = json.loads(final_match.group(1))
+            ids = [str(i) for i in parsed if re.match(r'P\d+-\d+', str(i))]
+            if ids:
+                return ids[:top_n * 2]
+        except Exception:
+            pass
+
+    tail = text[-1000:]
+    tail_ids = _extract_ordered_ids(tail)
+    if len(tail_ids) >= top_n:
+        return tail_ids[:top_n * 2]
+
+    full_ids = _extract_ordered_ids(text)
+    return full_ids[:top_n * 2]
+
+def _extract_ordered_ids(text: str) -> list:
+    all_ids = re.findall(r'P\d+-\d+', text)
+    seen = []
+    for pid in all_ids:
+        if pid not in seen:
+            seen.append(pid)
+    return seen
+
+def apply_diversity_filter(ids: list, dataset: list, top_n: int) -> list:
+    id_index = {p["id"]: p for p in dataset}
+
+    selected = []
+    selected_groups = set()
+    pillar_count = {}
+
+    for pid in ids:
+        if len(selected) >= top_n:
+            break
+        if pid not in id_index:
+            continue
+
+        principle = id_index[pid]
+        pillar_code = principle.get("pillar_code", "")
+
+        group_blocked = False
+        for g_idx, group in enumerate(SIMILARITY_GROUPS):
+            if pid in group and g_idx in selected_groups:
+                group_blocked = True
+                break
+        if group_blocked:
+            continue
+
+        if pillar_count.get(pillar_code, 0) >= 2:
+            continue
+
+        selected.append(pid)
+        pillar_count[pillar_code] = pillar_count.get(pillar_code, 0) + 1
+
+        for g_idx, group in enumerate(SIMILARITY_GROUPS):
+            if pid in group:
+                selected_groups.add(g_idx)
+
+    return selected
+
+def filter_fields(principle: dict) -> dict:
+    return {field: principle[field] for field in ALLOWED_FIELDS if field in principle}
+
+def extract(raw_kimi_output: str, dataset: list, top_n: int) -> dict:
+    ids = extract_ids_from_kimi(raw_kimi_output, top_n)
+    diverse_ids = apply_diversity_filter(ids, dataset, top_n)
+
+    if len(diverse_ids) < top_n:
+        for pid in ids:
+            if len(diverse_ids) >= top_n:
+                break
+            if pid not in diverse_ids:
+                diverse_ids.append(pid)
+
+    id_index = {p["id"]: p for p in dataset}
+    principles = []
+    missing = []
+
+    for pid in diverse_ids:
+        if pid in id_index:
+            principles.append(filter_fields(id_index[pid]))
+        else:
+            missing.append(pid)
+
+    return {
+        "principles": principles,
+        "ids_extracted": diverse_ids,
+        "count": len(principles),
+    }
+
+
+
+====================================================================================================
+FILE NAME: __init__.py
+PATH: api\stages\__init__.py
+====================================================================================================
+
+# stages package
+
+
+

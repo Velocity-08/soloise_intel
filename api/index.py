@@ -60,7 +60,7 @@ app.add_middleware(
 
 
 @app.post(
-    "/v1/recommend",
+    "/recommend",
     response_model=RecommendResponse,
     summary="Get ranked behavioural principles",
     responses={
@@ -80,7 +80,7 @@ async def recommend(
     key_id = key_row["id"]
     t_start = time.monotonic()
 
-    log.info(f"[{request_id[:8]}] /v1/recommend — user={user_id[:8]}")
+    log.info(f"[{request_id[:8]}] /recommend — user={user_id[:8]}")
 
     credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
 
@@ -153,7 +153,7 @@ async def root():
         "version": "1.0.0",
         "docs": "/docs",
         "endpoints": {
-            "POST /v1/recommend": "Get ranked principles. Requires Bearer token.",
+            "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
         },
     }

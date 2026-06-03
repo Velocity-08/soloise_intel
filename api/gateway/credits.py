@@ -30,12 +30,18 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
     try:
         response = (
             supabase.rpc(
-                "deduct_credits",
+                "deduct_credit",
                 {"p_user_id": user_id, "p_amount": cost},
             )
             .execute()
         )
     except Exception as e:
+        error_msg = str(e)
+        if "INSUFFICIENT_CREDITS" in error_msg:
+            raise HTTPException(
+                status_code=402,
+                detail={"error": "Insufficient credits.", "code": "INSUFFICIENT_CREDITS"},
+            )
         raise HTTPException(
             status_code=500,
             detail={"error": "Credit check failed. Please try again.", "code": "CREDIT_ERROR"},
