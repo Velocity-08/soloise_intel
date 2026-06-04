@@ -52,11 +52,22 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# Updated CORS for mobile and all devices
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=[
+        "https://soloise-frontend.vercel.app",  # Your frontend
+        "https://soloise-intel.vercel.app",     # Your backend
+        "http://localhost:3000",                # Local frontend
+        "http://localhost:8000",                # Local backend
+        "https://*.vercel.app",                 # All Vercel apps
+        "*"  # Allow all for now (remove in production if needed)
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],  # Allow all headers for mobile compatibility
+    expose_headers=["*"],
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
 
@@ -142,6 +153,22 @@ async def health():
         return {"status": "ok", "dataset": stats}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "error", "detail": str(e)})
+
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle OPTIONS requests for CORS preflight"""
+    return JSONResponse(
+        status_code=200,
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
 
 
 @app.get("/", summary="API info", include_in_schema=False)
