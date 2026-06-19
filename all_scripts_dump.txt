@@ -156,18 +156,71 @@ FastAPI wrapped with Mangum for serverless deployment.
 NOTE: vercel.json only builds api/index.py (see "builds" -> "src": "api/index.py").
 That means this is the ONLY Python file Vercel turns into a serverless function.
 api/mcp.py existed in the repo but was never deployed or routed to — every request,
-including /mcp/{user_id} and /.well-known/..., was actually hitting THIS file and
-falling through to FastAPI's default 405 handler (Allow: OPTIONS) because no route
-for those paths existed here.
-
-Fix: the MCP server logic now lives directly in this file, as the only deployed
-entrypoint. Do not rely on api/mcp.py unless vercel.json is also updated to build
-and route to it separately.
+including /mcp/{user_id} and /.well-known/..., was actually hitting THIS file.
+api/mcp.py has been deleted; this file is the single source of truth for both
+the REST API and the MCP server.
 
 Also: deliberately NOT exposing /.well-known/oauth-protected-resource. Letting
 that path 404 is what tells Claude's connector this server is authless. Serving
 a 200 there with an empty authorization_servers list is what caused the original
 "Couldn't register with sign-in service" error.
+
+──────────────────────────────────────────────────────────────────────────────
+MCP AUTH REDESIGN (this revision):
+Previously /mcp/{user_id} trusted a bare path param as identity, then called
+this API's own /recommend endpoint over HTTP using a shared SOLOISE_MASTER_KEY
+— which meant every MCP call was paying for itself twice (once via the master
+key's own credits inside /recommend, once via decrement_credits for the real
+user) and had zero real authentication (anyone who guessed/saw a user_id could
+spend that user's credits).
+
+Now: /mcp requires the same `Authorization: Bearer sk-sol-...` that /recommend
+requires, validated via the same validate_api_key() dependency. Once authed,
+the handler calls run_pipeline() directly in-process (no self-HTTP-call, no
+master key) and deducts credits via the same check_and_deduct_credit() that
+/recommend uses — same cost formula, one credit ledger, one identity check.
+──────────────────────────────────────────────────────────────────────────────
+ROUTING FIX (this revision):
+Claude's MCP connector calls the URL configured at connector-setup time, which
+includes a per-connector UUID as a trailing path segment, e.g.
+    POST /mcp/eb39351a-0abe-4492-b427-e0618df34586
+The old routes were registered as exactly "/mcp" with no path param, so that
+request matched no route for POST — it only structurally matched the
+"/{path:path}" OPTIONS catch-all below, which doesn't allow POST. Starlette's
+router sees a path match with no method match and returns 405 Method Not
+Allowed, without ever entering the handler (confirmed via Vercel logs: 10ms
+duration, "No outgoing requests").
+
+Fix: both /mcp routes now also accept an optional trailing /{connector_id}
+segment. connector_id is accepted but intentionally unused for auth/identity —
+identity still comes entirely from validate_api_key (Authorization: Bearer
+sk-sol-...), exactly as before. This means both of these now resolve to the
+same handlers:
+    POST /mcp
+    POST /mcp/eb39351a-0abe-4492-b427-e0618df34586
+──────────────────────────────────────────────────────────────────────────────
+AUTH FIX (this revision):
+Claude's connector UI (the simple "paste a URL" flow used here) has no field
+for entering a Bearer token — only a URL. So the user configured the
+connector with their actual API key embedded as the trailing path segment
+(previously documented as "connector_id"), not a UUID. With the routing fix
+above making /mcp/{connector_id} resolve, requests reached the handler, but
+mcp_handler still required Depends(validate_api_key), which only reads the
+Authorization header — which Claude's connector never sends. Result: "user
+didn't complete authentication" (Claude's connector trying and failing an
+OAuth-style flow it doesn't actually need to use).
+
+Fix: mcp_handler no longer hard-requires the header. It now accepts the key
+from EITHER source:
+  1. Authorization: Bearer sk-sol-... header, if present (so /mcp still works
+     for any client that does send a header, same as /recommend), OR
+  2. the trailing path segment (connector_id) used as the raw key, if no
+     header is present — this is the path Claude's connector actually uses.
+Both paths run through gateway.auth.lookup_key(), the same hash + Supabase
+lookup + is_active check used everywhere else. There is no separate, weaker
+validation path for path-based keys — same checks, same failure modes, same
+401s for bad/inactive keys either way.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -177,20 +230,19 @@ import uuid
 import logging
 import asyncio
 import traceback
+from typing import Optional
 
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
-import httpx
-from supabase import create_client
 
 from stages.dataset_loader import load_dataset, get_dataset_stats
 from pipeline import run_pipeline
-from gateway.auth import validate_api_key
+from gateway.auth import validate_api_key, lookup_key
 from gateway.credits import check_and_deduct_credit
 from gateway.logger import log_usage
 from gateway.models import RecommendRequest, RecommendResponse
@@ -325,19 +377,17 @@ async def health():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MCP server routes (Claude connector) — merged in from api/mcp.py since
-# vercel.json only deploys this file.
+# MCP server routes (Claude connector)
+#
+# Auth model: the raw API key can arrive two ways —
+#   1. Authorization: Bearer sk-sol-... header (same as /recommend), or
+#   2. the trailing /mcp/{connector_id} path segment, used as the raw key
+#      directly — this is what Claude's "paste a URL" connector flow sends,
+#      since that flow has no separate field for a Bearer token.
+# Both are validated through the same gateway.auth.lookup_key() — same hash,
+# same Supabase row, same is_active check. No user_id in the URL, no master
+# key, no second credit ledger, no weaker check for the path-based case.
 # ══════════════════════════════════════════════════════════════════════════
-
-SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-# NOTE: Vercel project only has SUPABASE_SERVICE_ROLE_KEY set (confirmed via
-# `vercel env ls`) — there is no separate SUPABASE_KEY. Using the service role
-# key here is also correct for this use case: this endpoint reads/writes
-# credit_balances for arbitrary user_ids server-side, which requires bypassing
-# RLS. Keeping SUPABASE_KEY as a fallback in case it's ever added later.
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
-SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
 
 MCP_TOOLS = [
     {
@@ -377,21 +427,40 @@ MCP_TOOLS = [
 ]
 
 
-@app.get("/mcp/{user_id}")
-async def mcp_probe(user_id: str):
+@app.get("/mcp")
+@app.get("/mcp/{connector_id}")
+async def mcp_probe(connector_id: Optional[str] = None):
     """Claude sends a GET first to check if the server is alive. Must return 200, not 405."""
     return JSONResponse(content={"status": "ok", "server": "soloise-absis"})
 
 
-@app.post("/mcp/{user_id}")
-async def mcp_handler(user_id: str, request: Request):
-    credits = await _mcp_get_credits(user_id)
-    if credits is None:
-        return _mcp_error(None, -32001,
-            f"Invalid user ID or DB error: {_last_credit_error}")
-    if credits <= 0:
-        return _mcp_error(None, -32002,
-            "No credits remaining. Top up at soloise-frontend.vercel.app/dashboard")
+@app.post("/mcp")
+@app.post("/mcp/{connector_id}")
+async def mcp_handler(request: Request, connector_id: Optional[str] = None):
+    """
+    Single MCP endpoint for all authenticated users.
+
+    Key resolution order:
+      1. Authorization: Bearer sk-sol-... header, if present.
+      2. Otherwise, connector_id (the trailing path segment) is treated as
+         the raw API key — this is the path Claude's connector actually
+         uses, since its "paste a URL" setup has no header field.
+    Either way, the raw key is validated via lookup_key() — same hash,
+    same Supabase lookup, same is_active check as /recommend.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        raw_key = auth_header[7:].strip()
+    else:
+        raw_key = connector_id or ""
+
+    try:
+        key_row = lookup_key(raw_key)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+
+    user_id = key_row["user_id"]
+    key_id = key_row["id"]
 
     try:
         body = await request.json()
@@ -417,9 +486,11 @@ async def mcp_handler(user_id: str, request: Request):
         arguments = params.get("arguments", {})
 
         if tool_name == "get_behavioural_principles":
-            result = await _mcp_get_principles(arguments, user_id, credits)
+            result = await _mcp_get_principles(arguments, user_id, key_id)
         elif tool_name == "check_credits":
-            result = f"✅ Credits remaining: {credits}\nTop up: soloise-frontend.vercel.app/dashboard"
+            from gateway.credits import get_balance
+            balance = await get_balance(user_id)
+            result = f"✅ Credits remaining: {balance}\nTop up: soloise-frontend.vercel.app/dashboard"
         else:
             result = f"Unknown tool: {tool_name}"
 
@@ -432,96 +503,73 @@ async def mcp_handler(user_id: str, request: Request):
         return _mcp_error(req_id, -32601, f"Method not found: {method}")
 
 
-_last_credit_error = None  # TEMP debug — remove once root cause confirmed
-
-
-async def _mcp_get_credits(user_id: str):
-    global _last_credit_error
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        result = (
-            supabase.table("credit_balances")
-            .select("credits")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-        if result.data is None:
-            _last_credit_error = "Query succeeded but result.data was None (no matching row found by Supabase client)"
-            return None
-        return result.data.get("credits", 0)
-    except Exception as e:
-        err_detail = f"{type(e).__name__}: {e}"
-        log.error(f"[MCP CREDIT CHECK ERROR] {err_detail}")
-        _last_credit_error = err_detail
-        return None
-
-
-def _mcp_deduct_credit(user_id: str):
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase.rpc("decrement_credits", {"uid": user_id}).execute()
-    except Exception as e:
-        log.error(f"[MCP CREDIT DEDUCT ERROR] {e}")
-
-
-async def _mcp_get_principles(args: dict, user_id: str, credits: int) -> str:
+async def _mcp_get_principles(args: dict, user_id: str, key_id: str) -> str:
+    """
+    Runs the same pipeline /recommend uses, in-process. Same credit check,
+    same cost formula (max(1, len(query) // 100) via check_and_deduct_credit),
+    same usage logging. No HTTP self-call, no master key.
+    """
     query = args.get("query", "").strip()
     top_n = int(args.get("top_n", 5))
 
     if not query:
         return "Error: query cannot be empty."
-    if not SOLOISE_MASTER_KEY:
-        return "Error: Server misconfigured. Contact support."
+
+    t_start = time.monotonic()
 
     try:
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            resp = await client.post(
-                f"{SOLOISE_BASE_URL}/recommend",
-                json={"query": query, "top_n": top_n},
-                headers={
-                    "Authorization": f"Bearer {SOLOISE_MASTER_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
-
-        if resp.status_code == 402:
-            return "Error: Master credits exhausted. Contact support."
-        if resp.status_code != 200:
-            return f"Error: Upstream API returned {resp.status_code}"
-
-        data = resp.json()
-        principles = data.get("results", [])
-
-        _mcp_deduct_credit(user_id)
-
-        lines = [
-            f"## ABSIS Behavioural Principles — Top {len(principles)} for: \"{query}\"",
-            f"Credits remaining after this call: {credits - 1}",
-            "",
-        ]
-
-        for i, p in enumerate(principles, 1):
-            lines.append(f"### {i}. {p.get('principle_name')} [{p.get('id')}]")
-            lines.append(f"**Pillar:** {p.get('pillar')}")
-            lines.append(f"**One-liner:** {p.get('one_liner')}")
-            lines.append(f"**Plain English:** {p.get('plain_english')}")
-            lines.append(f"**Human fear/desire:** {p.get('human_fear_or_desire')}")
-            lines.append(f"**When to use:** {p.get('when_to_use')}")
-            lines.append(f"**When NOT to use:** {p.get('when_NOT_to_use')}")
-            lines.append(f"**Exact implementation:** {p.get('exact_implementation')}")
-            lines.append(f"**Example copy:** {p.get('example_copy')}")
-            lines.append(f"**Power level:** {p.get('power_level')} | Ethical risk: {p.get('ethical_risk')}")
-            lines.append("")
-
-        lines.append("---")
-        lines.append("Apply ALL of the above principles when generating the content.")
-        return "\n".join(lines)
-
-    except httpx.TimeoutException:
-        return "Error: Request timed out. Try again."
+        credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(query))
     except Exception as e:
-        return f"Error: {str(e)}"
+        log.error(f"[MCP] Credit check failed for user={user_id[:8]}: {e}")
+        if "INSUFFICIENT_CREDITS" in str(e):
+            return "Error: No credits remaining. Top up at soloise-frontend.vercel.app/dashboard"
+        return f"Error: Credit check failed: {str(e)}"
+
+    try:
+        principles = await asyncio.to_thread(
+            run_pipeline,
+            raw_input=query,
+            top_n=top_n,
+            debug=False,
+        )
+    except Exception as e:
+        log.error(f"[MCP] Pipeline failed for user={user_id[:8]}: {e}\n{traceback.format_exc()}")
+        asyncio.create_task(log_usage(
+            user_id=user_id, key_id=key_id,
+            query_length=len(query), top_n=top_n,
+            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
+        ))
+        return f"Error: Pipeline failed: {str(e)}"
+
+    latency_ms = int((time.monotonic() - t_start) * 1000)
+    asyncio.create_task(log_usage(
+        user_id=user_id, key_id=key_id,
+        query_length=len(query), top_n=top_n,
+        latency_ms=latency_ms, success=True,
+    ))
+
+    lines = [
+        f"## ABSIS Behavioural Principles — Top {len(principles)} for: \"{query}\"",
+        f"Credits used: {credits_used} | Credits remaining: {credits_remaining}",
+        "",
+    ]
+
+    for i, p in enumerate(principles, 1):
+        lines.append(f"### {i}. {p.get('principle_name')} [{p.get('id')}]")
+        lines.append(f"**Pillar:** {p.get('pillar')}")
+        lines.append(f"**One-liner:** {p.get('one_liner')}")
+        lines.append(f"**Plain English:** {p.get('plain_english')}")
+        lines.append(f"**Human fear/desire:** {p.get('human_fear_or_desire')}")
+        lines.append(f"**When to use:** {p.get('when_to_use')}")
+        lines.append(f"**When NOT to use:** {p.get('when_NOT_to_use')}")
+        lines.append(f"**Exact implementation:** {p.get('exact_implementation')}")
+        lines.append(f"**Example copy:** {p.get('example_copy')}")
+        lines.append(f"**Power level:** {p.get('power_level')} | Ethical risk: {p.get('ethical_risk')}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("Apply ALL of the above principles when generating the content.")
+    return "\n".join(lines)
 
 
 def _mcp_ok(req_id, result):
@@ -562,255 +610,14 @@ async def root():
         "endpoints": {
             "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
-            "GET/POST /mcp/{user_id}": "MCP server endpoint for Claude connector.",
+            "GET/POST /mcp": "MCP server endpoint for Claude connector. Requires Bearer token.",
+            "GET/POST /mcp/{connector_id}": "Same as /mcp; connector_id is accepted but unused.",
         },
     }
 
 
 # ── Mangum handler (Vercel / AWS Lambda adapter) ────────────────────────────
 handler = Mangum(app, lifespan="off")
-
-
-====================================================================================================
-FILE NAME: mcp.py
-PATH: api\mcp.py
-====================================================================================================
-
-"""
-Soloise MCP Server — api/mcp.py (FIXED)
-
-Root cause of the "Connection issue / Couldn't register with sign-in service" error:
-This server was serving a 200 response at /.well-known/oauth-protected-resource
-with an empty authorization_servers list. Claude's connector treats *any* 200
-response there as "this server requires OAuth — here is its metadata," then tries
-to discover/register a client against the (empty) authorization_servers list,
-which fails with the exact "Couldn't register with sign-in service" error.
-
-The correct way to say "no OAuth needed" is to NOT serve that endpoint at all
-(let it 404). Claude only starts the OAuth discovery flow when it receives a
-401 from the MCP endpoint itself, or finds real metadata via .well-known.
-An authless server should just answer MCP calls directly.
-
-We've removed the .well-known route entirely.
-"""
-
-import os
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from supabase import create_client
-from mangum import Mangum
-
-SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
-
-TOOLS = [
-    {
-        "name": "get_behavioural_principles",
-        "description": (
-            "Retrieves the most relevant behavioural psychology principles from the ABSIS dataset "
-            "for any content, copy, or UX writing task. "
-            "ALWAYS call this BEFORE writing any marketing copy, landing page content, email, CTA, "
-            "headline, onboarding flow, or any text meant to persuade or convert users. "
-            "Apply ALL returned principles when generating content."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Describe what you're writing and the goal. Include content type, "
-                        "target audience, and conversion/engagement goal. "
-                        "Example: 'hero section for B2B SaaS, goal is free trial signups'"
-                    ),
-                },
-                "top_n": {
-                    "type": "integer",
-                    "description": "Number of principles to return (1-10). Default: 5",
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "check_credits",
-        "description": "Check your remaining Soloise credits.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-]
-
-app = FastAPI()
-
-
-# ── MCP endpoint — handles GET (Claude liveness probe) + POST (actual calls) ──
-# NOTE: deliberately NO /.well-known/oauth-protected-resource route.
-# Letting that 404 is what tells Claude "this server is authless" — see header
-# comment above. Do not re-add it unless you are actually implementing OAuth
-# with a real authorization_servers list.
-
-@app.get("/mcp/{user_id}")
-async def mcp_probe(user_id: str):
-    """
-    Claude sends a GET first to check if the server is alive.
-    Must return 200, not 405.
-    """
-    return JSONResponse(content={"status": "ok", "server": "soloise-absis"})
-
-
-@app.post("/mcp/{user_id}")
-async def mcp_handler(user_id: str, request: Request):
-    # 1. Check user credits
-    credits = await _get_credits(user_id)
-    if credits is None:
-        return _error(None, -32001,
-            "Invalid user ID. Get your MCP URL from your Soloise dashboard at soloise-frontend.vercel.app")
-    if credits <= 0:
-        return _error(None, -32002,
-            "No credits remaining. Top up at soloise-frontend.vercel.app/dashboard")
-
-    # 2. Parse MCP message
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    method = body.get("method")
-    params = body.get("params", {})
-    req_id = body.get("id")
-
-    # 3. Route MCP methods
-    if method == "initialize":
-        return _ok(req_id, {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "soloise-absis", "version": "1.0.0"},
-        })
-
-    elif method == "tools/list":
-        return _ok(req_id, {"tools": TOOLS})
-
-    elif method == "tools/call":
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-
-        if tool_name == "get_behavioural_principles":
-            result = await _get_principles(arguments, user_id, credits)
-        elif tool_name == "check_credits":
-            result = f"✅ Credits remaining: {credits}\nTop up: soloise-frontend.vercel.app/dashboard"
-        else:
-            result = f"Unknown tool: {tool_name}"
-
-        return _ok(req_id, {"content": [{"type": "text", "text": result}]})
-
-    elif method and method.startswith("notifications/"):
-        return JSONResponse(content={})
-
-    else:
-        return _error(req_id, -32601, f"Method not found: {method}")
-
-
-# ── Credit helpers ────────────────────────────────────────────────────────────
-
-async def _get_credits(user_id: str) -> int | None:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        result = (
-            supabase.table("credit_balances")
-            .select("credits")
-            .eq("user_id", user_id)
-            .maybeSingle()
-            .execute()
-        )
-        if result.data is None:
-            return None
-        return result.data.get("credits", 0)
-    except Exception as e:
-        print(f"[CREDIT CHECK ERROR] {e}")
-        return None
-
-
-def _deduct_credit(user_id: str):
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase.rpc("decrement_credits", {"uid": user_id}).execute()
-    except Exception as e:
-        print(f"[CREDIT DEDUCT ERROR] {e}")
-
-
-# ── Main tool ─────────────────────────────────────────────────────────────────
-
-async def _get_principles(args: dict, user_id: str, credits: int) -> str:
-    query = args.get("query", "").strip()
-    top_n = int(args.get("top_n", 5))
-
-    if not query:
-        return "Error: query cannot be empty."
-    if not SOLOISE_MASTER_KEY:
-        return "Error: Server misconfigured. Contact support."
-
-    try:
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            resp = await client.post(
-                f"{SOLOISE_BASE_URL}/recommend",
-                json={"query": query, "top_n": top_n},
-                headers={
-                    "Authorization": f"Bearer {SOLOISE_MASTER_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
-
-        if resp.status_code == 402:
-            return "Error: Master credits exhausted. Contact support."
-        if resp.status_code != 200:
-            return f"Error: Upstream API returned {resp.status_code}"
-
-        data = resp.json()
-        principles = data.get("results", [])
-
-        _deduct_credit(user_id)
-
-        lines = [
-            f"## ABSIS Behavioural Principles — Top {len(principles)} for: \"{query}\"",
-            f"Credits remaining after this call: {credits - 1}",
-            "",
-        ]
-
-        for i, p in enumerate(principles, 1):
-            lines.append(f"### {i}. {p.get('principle_name')} [{p.get('id')}]")
-            lines.append(f"**Pillar:** {p.get('pillar')}")
-            lines.append(f"**One-liner:** {p.get('one_liner')}")
-            lines.append(f"**Plain English:** {p.get('plain_english')}")
-            lines.append(f"**Human fear/desire:** {p.get('human_fear_or_desire')}")
-            lines.append(f"**When to use:** {p.get('when_to_use')}")
-            lines.append(f"**When NOT to use:** {p.get('when_NOT_to_use')}")
-            lines.append(f"**Exact implementation:** {p.get('exact_implementation')}")
-            lines.append(f"**Example copy:** {p.get('example_copy')}")
-            lines.append(f"**Power level:** {p.get('power_level')} | Ethical risk: {p.get('ethical_risk')}")
-            lines.append("")
-
-        lines.append("---")
-        lines.append("Apply ALL of the above principles when generating the content.")
-        return "\n".join(lines)
-
-    except httpx.TimeoutException:
-        return "Error: Request timed out. Try again."
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _ok(req_id, result):
-    return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": result})
-
-def _error(req_id, code, message):
-    return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
-
-handler = Mangum(app)
 
 
 ====================================================================================================
@@ -883,6 +690,20 @@ PATH: api\gateway\auth.py
 
 """
 Auth — validates the Bearer API key on every request.
+
+REFACTOR (this revision):
+Pulled the actual "given a raw key string, return the key row or raise 401"
+logic out of validate_api_key into a standalone lookup_key() function.
+validate_api_key (used by /recommend and as the default /mcp dependency)
+just extracts the raw key from the Authorization header and calls lookup_key().
+
+Why: Claude's MCP connector UI (the simple "paste a URL" flow) has no field
+for entering a Bearer token — it only takes a URL. So for /mcp specifically,
+the API key has to travel as the trailing path segment instead of a header
+(see api/index.py mcp_handler). Both paths now validate through the exact
+same lookup_key() — same hash, same Supabase query, same is_active check —
+so there's one source of truth for "is this a valid, active key" regardless
+of whether it arrived via header or path.
 """
 
 import hashlib
@@ -907,19 +728,18 @@ def hash_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode()).hexdigest()
 
 
-bearer_scheme = HTTPBearer(auto_error=False)
-
-
-async def validate_api_key(
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-) -> dict:
-    if not credentials or not credentials.credentials:
+def lookup_key(raw_key: str) -> dict:
+    """
+    Validate a raw API key string and return its api_keys row.
+    Raises HTTPException(401) on any failure. This is the single source of
+    truth for key validation — both header-based and path-based auth call
+    this, so there is exactly one place that defines what a "valid key" is.
+    """
+    if not raw_key:
         raise HTTPException(
             status_code=401,
             detail={"error": "Missing API key. Send: Authorization: Bearer <key>", "code": "MISSING_KEY"},
         )
-
-    raw_key = credentials.credentials
 
     if not raw_key.startswith("sk-sol-"):
         raise HTTPException(
@@ -958,6 +778,25 @@ async def validate_api_key(
 
     return response.data
 
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def validate_api_key(
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> dict:
+    """
+    Header-based auth dependency, used by /recommend and as the default
+    auth path for /mcp. Extracts the raw key from the Authorization header
+    and delegates to lookup_key() for the actual validation.
+    """
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Missing API key. Send: Authorization: Bearer <key>", "code": "MISSING_KEY"},
+        )
+
+    return lookup_key(credentials.credentials)
 
 
 ====================================================================================================

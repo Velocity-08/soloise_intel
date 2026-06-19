@@ -84,7 +84,7 @@ from typing import Optional
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import FastAPI, Depends, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
@@ -223,6 +223,11 @@ async def health():
         return {"status": "ok", "dataset": stats}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "error", "detail": str(e)})
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 # ══════════════════════════════════════════════════════════════════════════
