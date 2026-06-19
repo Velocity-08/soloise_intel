@@ -232,7 +232,7 @@ async def mcp_handler(user_id: str, request: Request):
     credits = await _mcp_get_credits(user_id)
     if credits is None:
         return _mcp_error(None, -32001,
-            "Invalid user ID. Get your MCP URL from your Soloise dashboard at soloise-frontend.vercel.app")
+            f"Invalid user ID or DB error: {_last_credit_error}")
     if credits <= 0:
         return _mcp_error(None, -32002,
             "No credits remaining. Top up at soloise-frontend.vercel.app/dashboard")
@@ -276,7 +276,11 @@ async def mcp_handler(user_id: str, request: Request):
         return _mcp_error(req_id, -32601, f"Method not found: {method}")
 
 
+_last_credit_error = None  # TEMP debug — remove once root cause confirmed
+
+
 async def _mcp_get_credits(user_id: str):
+    global _last_credit_error
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         result = (
@@ -287,10 +291,13 @@ async def _mcp_get_credits(user_id: str):
             .execute()
         )
         if result.data is None:
+            _last_credit_error = "Query succeeded but result.data was None (no matching row found by Supabase client)"
             return None
         return result.data.get("credits", 0)
     except Exception as e:
-        log.error(f"[MCP CREDIT CHECK ERROR] {e}")
+        err_detail = f"{type(e).__name__}: {e}"
+        log.error(f"[MCP CREDIT CHECK ERROR] {err_detail}")
+        _last_credit_error = err_detail
         return None
 
 
