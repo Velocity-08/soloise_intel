@@ -1,4 +1,37 @@
 ====================================================================================================
+FILE NAME: check.py
+PATH: check.py
+====================================================================================================
+
+import hashlib
+from supabase import create_client
+
+SUPABASE_URL = "https://yriwptbsnqmalmbqnbgn.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlyaXdwdGJzbnFtYWxtYnFuYmduIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTkxMTcwMiwiZXhwIjoyMDk1NDg3NzAyfQ.ukoBlzV-78BmyGHLwZGAkA5Vcg4KHe4c0GnQ3Dgh1uc"
+
+# The key from your frontend
+raw_key = "sk-sol-6ea8d0f4730b2bf53d7ed735dbdfee9b8c9b218b"
+calculated_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+print(f"Raw key: {raw_key}")
+print(f"Calculated hash: {calculated_hash}")
+print(f"Expected prefix: {raw_key[:16]}")
+
+# Get the actual hash from database
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+result = supabase.table("api_keys").select("key_hash, key_prefix").eq("key_prefix", "sk-sol-6ea8d0f47").execute()
+
+if result.data:
+    db_hash = result.data[0]["key_hash"]
+    db_prefix = result.data[0]["key_prefix"]
+    print(f"\nDatabase hash: {db_hash}")
+    print(f"Database prefix: {db_prefix}")
+    print(f"\nHashes match: {calculated_hash == db_hash}")
+else:
+    print("Key not found in database")
+
+
+====================================================================================================
 FILE NAME: script_exporter_backend.py
 PATH: script_exporter_backend.py
 ====================================================================================================
@@ -87,6 +120,31 @@ if __name__ == "__main__":
 
 
 ====================================================================================================
+FILE NAME: test.py
+PATH: test.py
+====================================================================================================
+
+from supabase import create_client
+
+SUPABASE_URL = "https://yriwptbsnqmalmbqnbgn.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlyaXdwdGJzbnFtYWxtYnFuYmduIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTkxMTcwMiwiZXhwIjoyMDk1NDg3NzAyfQ.ukoBlzV-78BmyGHLwZGAkA5Vcg4KHe4c0GnQ3Dgh1uc"
+
+print("Testing Supabase connection...")
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Client created")
+    
+    # Try to query a table
+    result = supabase.table("api_keys").select("*").limit(1).execute()
+    print(f"✅ Query successful! Found {len(result.data)} keys")
+    print(f"First key: {result.data[0]['key_prefix'] if result.data else 'None'}")
+    
+except Exception as e:
+    print(f"❌ Error: {e}")
+    print(f"Error type: {type(e).__name__}")
+
+
+====================================================================================================
 FILE NAME: index.py
 PATH: api\index.py
 ====================================================================================================
@@ -102,6 +160,7 @@ import time
 import uuid
 import logging
 import asyncio
+import traceback
 
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -144,16 +203,27 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# Updated CORS for mobile and all devices
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=[
+        "https://soloise-frontend.vercel.app",  # Your frontend
+        "https://soloise-intel.vercel.app",     # Your backend
+        "http://localhost:3000",                # Local frontend
+        "http://localhost:8000",                # Local backend
+        "https://*.vercel.app",                 # All Vercel apps
+        "*"  # Allow all for now (remove in production if needed)
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],  # Allow all headers for mobile compatibility
+    expose_headers=["*"],
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
 
 @app.post(
-    "/v1/recommend",
+    "/recommend",
     response_model=RecommendResponse,
     summary="Get ranked behavioural principles",
     responses={
@@ -173,9 +243,17 @@ async def recommend(
     key_id = key_row["id"]
     t_start = time.monotonic()
 
-    log.info(f"[{request_id[:8]}] /v1/recommend — user={user_id[:8]}")
+    log.info(f"[{request_id[:8]}] /recommend — user={user_id[:8]}")
 
-    credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
+    try:
+        credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(body.query))
+    except Exception as e:
+        log.error(f"[{request_id[:8]}] Credit check failed: {str(e)}")
+        return JSONResponse(status_code=402, content={
+            "success": False, 
+            "request_id": request_id,
+            "error": {"type": "credit_error", "message": str(e)}
+        })
 
     try:
         principles = await asyncio.to_thread(
@@ -184,31 +262,20 @@ async def recommend(
             top_n=body.top_n,
             debug=False,
         )
-    except ValueError as e:
+    except Exception as e:
+        error_details = traceback.format_exc()
+        log.error(f"[{request_id[:8]}] Pipeline failed: {str(e)}\n{error_details}")
+        
         asyncio.create_task(log_usage(
             user_id=user_id, key_id=key_id,
             query_length=len(body.query), top_n=body.top_n,
             latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
         ))
-        return JSONResponse(status_code=400, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "validation_error", "message": str(e)},
-        })
-    except RuntimeError as e:
-        asyncio.create_task(log_usage(
-            user_id=user_id, key_id=key_id,
-            query_length=len(body.query), top_n=body.top_n,
-            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
-        ))
-        return JSONResponse(status_code=502, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "upstream_error", "message": str(e)},
-        })
-    except Exception:
-        log.exception(f"[{request_id[:8]}] Unexpected pipeline error")
+        
         return JSONResponse(status_code=500, content={
-            "success": False, "request_id": request_id,
-            "error": {"type": "internal_error", "message": "Internal error."},
+            "success": False, 
+            "request_id": request_id,
+            "error": {"type": "pipeline_error", "message": str(e)}
         })
 
     latency_ms = int((time.monotonic() - t_start) * 1000)
@@ -239,6 +306,22 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "error", "detail": str(e)})
 
 
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle OPTIONS requests for CORS preflight"""
+    return JSONResponse(
+        status_code=200,
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
+
+
 @app.get("/", summary="API info", include_in_schema=False)
 async def root():
     return {
@@ -246,7 +329,7 @@ async def root():
         "version": "1.0.0",
         "docs": "/docs",
         "endpoints": {
-            "POST /v1/recommend": "Get ranked principles. Requires Bearer token.",
+            "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
         },
     }
@@ -254,7 +337,6 @@ async def root():
 
 # ── Mangum handler (Vercel / AWS Lambda adapter) ─────────────────────────────
 handler = Mangum(app, lifespan="off")
-
 
 
 ====================================================================================================
@@ -439,17 +521,25 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
     cost = max(1, query_length // 100)
 
     try:
+        # Changed from "deduct_credit" to "deduct_credits" to match your Supabase function
         response = (
             supabase.rpc(
-                "deduct_credits",
+                "deduct_credits",  # ← This is the correct function name from your SQL
                 {"p_user_id": user_id, "p_amount": cost},
             )
             .execute()
         )
     except Exception as e:
+        error_msg = str(e)
+        print(f"Credit deduction error: {error_msg}")  # For debugging
+        if "INSUFFICIENT_CREDITS" in error_msg:
+            raise HTTPException(
+                status_code=402,
+                detail={"error": "Insufficient credits.", "code": "INSUFFICIENT_CREDITS"},
+            )
         raise HTTPException(
             status_code=500,
-            detail={"error": "Credit check failed. Please try again.", "code": "CREDIT_ERROR"},
+            detail={"error": f"Credit check failed: {error_msg}", "code": "CREDIT_ERROR"},
         )
 
     data = response.data
@@ -465,17 +555,20 @@ async def check_and_deduct_credit(user_id: str, query_length: int) -> tuple[int,
 
 async def get_balance(user_id: str) -> int:
     supabase = _get_supabase()
-    response = (
-        supabase.table("credit_balances")
-        .select("credits")
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not response.data:
+    try:
+        response = (
+            supabase.table("credit_balances")
+            .select("credits")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+        if not response.data:
+            return 0
+        return response.data["credits"]
+    except Exception as e:
+        print(f"Error getting balance: {e}")
         return 0
-    return response.data["credits"]
-
 
 
 ====================================================================================================
