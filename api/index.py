@@ -48,6 +48,28 @@ same handlers:
     POST /mcp
     POST /mcp/eb39351a-0abe-4492-b427-e0618df34586
 ──────────────────────────────────────────────────────────────────────────────
+AUTH FIX (this revision):
+Claude's connector UI (the simple "paste a URL" flow used here) has no field
+for entering a Bearer token — only a URL. So the user configured the
+connector with their actual API key embedded as the trailing path segment
+(previously documented as "connector_id"), not a UUID. With the routing fix
+above making /mcp/{connector_id} resolve, requests reached the handler, but
+mcp_handler still required Depends(validate_api_key), which only reads the
+Authorization header — which Claude's connector never sends. Result: "user
+didn't complete authentication" (Claude's connector trying and failing an
+OAuth-style flow it doesn't actually need to use).
+
+Fix: mcp_handler no longer hard-requires the header. It now accepts the key
+from EITHER source:
+  1. Authorization: Bearer sk-sol-... header, if present (so /mcp still works
+     for any client that does send a header, same as /recommend), OR
+  2. the trailing path segment (connector_id) used as the raw key, if no
+     header is present — this is the path Claude's connector actually uses.
+Both paths run through gateway.auth.lookup_key(), the same hash + Supabase
+lookup + is_active check used everywhere else. There is no separate, weaker
+validation path for path-based keys — same checks, same failure modes, same
+401s for bad/inactive keys either way.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -62,14 +84,14 @@ from typing import Optional
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
 from stages.dataset_loader import load_dataset, get_dataset_stats
 from pipeline import run_pipeline
-from gateway.auth import validate_api_key
+from gateway.auth import validate_api_key, lookup_key
 from gateway.credits import check_and_deduct_credit
 from gateway.logger import log_usage
 from gateway.models import RecommendRequest, RecommendResponse
@@ -206,15 +228,14 @@ async def health():
 # ══════════════════════════════════════════════════════════════════════════
 # MCP server routes (Claude connector)
 #
-# Auth model: identical to /recommend. The Authorization: Bearer sk-sol-...
-# header is required and validated via validate_api_key — same dependency,
-# same api_keys table lookup, same is_active check. No user_id in the URL,
-# no master key, no second credit ledger.
-#
-# Routing: both GET and POST accept either "/mcp" or "/mcp/{connector_id}".
-# connector_id is accepted purely so Claude's connector URL (which includes
-# a trailing UUID) resolves to a real route instead of 405ing. It is never
-# used for identity or auth — see ROUTING FIX note at the top of this file.
+# Auth model: the raw API key can arrive two ways —
+#   1. Authorization: Bearer sk-sol-... header (same as /recommend), or
+#   2. the trailing /mcp/{connector_id} path segment, used as the raw key
+#      directly — this is what Claude's "paste a URL" connector flow sends,
+#      since that flow has no separate field for a Bearer token.
+# Both are validated through the same gateway.auth.lookup_key() — same hash,
+# same Supabase row, same is_active check. No user_id in the URL, no master
+# key, no second credit ledger, no weaker check for the path-based case.
 # ══════════════════════════════════════════════════════════════════════════
 
 MCP_TOOLS = [
@@ -264,17 +285,29 @@ async def mcp_probe(connector_id: Optional[str] = None):
 
 @app.post("/mcp")
 @app.post("/mcp/{connector_id}")
-async def mcp_handler(
-    request: Request,
-    connector_id: Optional[str] = None,
-    key_row: dict = Depends(validate_api_key),
-):
+async def mcp_handler(request: Request, connector_id: Optional[str] = None):
     """
     Single MCP endpoint for all authenticated users.
-    Identity comes entirely from validate_api_key (Authorization: Bearer sk-sol-...),
-    exactly like /recommend. connector_id (if present in the URL) is accepted but
-    unused — no user_id path param, no master key, no per-connector branching.
+
+    Key resolution order:
+      1. Authorization: Bearer sk-sol-... header, if present.
+      2. Otherwise, connector_id (the trailing path segment) is treated as
+         the raw API key — this is the path Claude's connector actually
+         uses, since its "paste a URL" setup has no header field.
+    Either way, the raw key is validated via lookup_key() — same hash,
+    same Supabase lookup, same is_active check as /recommend.
     """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        raw_key = auth_header[7:].strip()
+    else:
+        raw_key = connector_id or ""
+
+    try:
+        key_row = lookup_key(raw_key)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+
     user_id = key_row["user_id"]
     key_id = key_row["id"]
 
