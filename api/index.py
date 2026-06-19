@@ -5,18 +5,30 @@ FastAPI wrapped with Mangum for serverless deployment.
 NOTE: vercel.json only builds api/index.py (see "builds" -> "src": "api/index.py").
 That means this is the ONLY Python file Vercel turns into a serverless function.
 api/mcp.py existed in the repo but was never deployed or routed to — every request,
-including /mcp/{user_id} and /.well-known/..., was actually hitting THIS file and
-falling through to FastAPI's default 405 handler (Allow: OPTIONS) because no route
-for those paths existed here.
-
-Fix: the MCP server logic now lives directly in this file, as the only deployed
-entrypoint. Do not rely on api/mcp.py unless vercel.json is also updated to build
-and route to it separately.
+including /mcp/{user_id} and /.well-known/..., was actually hitting THIS file.
+api/mcp.py has been deleted; this file is the single source of truth for both
+the REST API and the MCP server.
 
 Also: deliberately NOT exposing /.well-known/oauth-protected-resource. Letting
 that path 404 is what tells Claude's connector this server is authless. Serving
 a 200 there with an empty authorization_servers list is what caused the original
 "Couldn't register with sign-in service" error.
+
+──────────────────────────────────────────────────────────────────────────────
+MCP AUTH REDESIGN (this revision):
+Previously /mcp/{user_id} trusted a bare path param as identity, then called
+this API's own /recommend endpoint over HTTP using a shared SOLOISE_MASTER_KEY
+— which meant every MCP call was paying for itself twice (once via the master
+key's own credits inside /recommend, once via decrement_credits for the real
+user) and had zero real authentication (anyone who guessed/saw a user_id could
+spend that user's credits).
+
+Now: /mcp requires the same `Authorization: Bearer sk-sol-...` that /recommend
+requires, validated via the same validate_api_key() dependency. Once authed,
+the handler calls run_pipeline() directly in-process (no self-HTTP-call, no
+master key) and deducts credits via the same check_and_deduct_credit() that
+/recommend uses — same cost formula, one credit ledger, one identity check.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -34,8 +46,6 @@ from fastapi import FastAPI, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
-import httpx
-from supabase import create_client
 
 from stages.dataset_loader import load_dataset, get_dataset_stats
 from pipeline import run_pipeline
@@ -174,19 +184,13 @@ async def health():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MCP server routes (Claude connector) — merged in from api/mcp.py since
-# vercel.json only deploys this file.
+# MCP server routes (Claude connector)
+#
+# Auth model: identical to /recommend. The Authorization: Bearer sk-sol-...
+# header is required and validated via validate_api_key — same dependency,
+# same api_keys table lookup, same is_active check. No user_id in the URL,
+# no master key, no second credit ledger.
 # ══════════════════════════════════════════════════════════════════════════
-
-SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-# NOTE: Vercel project only has SUPABASE_SERVICE_ROLE_KEY set (confirmed via
-# `vercel env ls`) — there is no separate SUPABASE_KEY. Using the service role
-# key here is also correct for this use case: this endpoint reads/writes
-# credit_balances for arbitrary user_ids server-side, which requires bypassing
-# RLS. Keeping SUPABASE_KEY as a fallback in case it's ever added later.
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
-SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
 
 MCP_TOOLS = [
     {
@@ -226,21 +230,21 @@ MCP_TOOLS = [
 ]
 
 
-@app.get("/mcp/{user_id}")
-async def mcp_probe(user_id: str):
+@app.get("/mcp")
+async def mcp_probe():
     """Claude sends a GET first to check if the server is alive. Must return 200, not 405."""
     return JSONResponse(content={"status": "ok", "server": "soloise-absis"})
 
 
-@app.post("/mcp/{user_id}")
-async def mcp_handler(user_id: str, request: Request):
-    credits = await _mcp_get_credits(user_id)
-    if credits is None:
-        return _mcp_error(None, -32001,
-            f"Invalid user ID or DB error: {_last_credit_error}")
-    if credits <= 0:
-        return _mcp_error(None, -32002,
-            "No credits remaining. Top up at soloise-frontend.vercel.app/dashboard")
+@app.post("/mcp")
+async def mcp_handler(request: Request, key_row: dict = Depends(validate_api_key)):
+    """
+    Single MCP endpoint for all authenticated users.
+    Identity comes entirely from validate_api_key (Authorization: Bearer sk-sol-...),
+    exactly like /recommend. No user_id path param, no master key.
+    """
+    user_id = key_row["user_id"]
+    key_id = key_row["id"]
 
     try:
         body = await request.json()
@@ -266,9 +270,11 @@ async def mcp_handler(user_id: str, request: Request):
         arguments = params.get("arguments", {})
 
         if tool_name == "get_behavioural_principles":
-            result = await _mcp_get_principles(arguments, user_id, credits)
+            result = await _mcp_get_principles(arguments, user_id, key_id)
         elif tool_name == "check_credits":
-            result = f"✅ Credits remaining: {credits}\nTop up: soloise-frontend.vercel.app/dashboard"
+            from gateway.credits import get_balance
+            balance = await get_balance(user_id)
+            result = f"✅ Credits remaining: {balance}\nTop up: soloise-frontend.vercel.app/dashboard"
         else:
             result = f"Unknown tool: {tool_name}"
 
@@ -281,96 +287,73 @@ async def mcp_handler(user_id: str, request: Request):
         return _mcp_error(req_id, -32601, f"Method not found: {method}")
 
 
-_last_credit_error = None  # TEMP debug — remove once root cause confirmed
-
-
-async def _mcp_get_credits(user_id: str):
-    global _last_credit_error
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        result = (
-            supabase.table("credit_balances")
-            .select("credits")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-        if result.data is None:
-            _last_credit_error = "Query succeeded but result.data was None (no matching row found by Supabase client)"
-            return None
-        return result.data.get("credits", 0)
-    except Exception as e:
-        err_detail = f"{type(e).__name__}: {e}"
-        log.error(f"[MCP CREDIT CHECK ERROR] {err_detail}")
-        _last_credit_error = err_detail
-        return None
-
-
-def _mcp_deduct_credit(user_id: str):
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase.rpc("decrement_credits", {"uid": user_id}).execute()
-    except Exception as e:
-        log.error(f"[MCP CREDIT DEDUCT ERROR] {e}")
-
-
-async def _mcp_get_principles(args: dict, user_id: str, credits: int) -> str:
+async def _mcp_get_principles(args: dict, user_id: str, key_id: str) -> str:
+    """
+    Runs the same pipeline /recommend uses, in-process. Same credit check,
+    same cost formula (max(1, len(query) // 100) via check_and_deduct_credit),
+    same usage logging. No HTTP self-call, no master key.
+    """
     query = args.get("query", "").strip()
     top_n = int(args.get("top_n", 5))
 
     if not query:
         return "Error: query cannot be empty."
-    if not SOLOISE_MASTER_KEY:
-        return "Error: Server misconfigured. Contact support."
+
+    t_start = time.monotonic()
 
     try:
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            resp = await client.post(
-                f"{SOLOISE_BASE_URL}/recommend",
-                json={"query": query, "top_n": top_n},
-                headers={
-                    "Authorization": f"Bearer {SOLOISE_MASTER_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
-
-        if resp.status_code == 402:
-            return "Error: Master credits exhausted. Contact support."
-        if resp.status_code != 200:
-            return f"Error: Upstream API returned {resp.status_code}"
-
-        data = resp.json()
-        principles = data.get("results", [])
-
-        _mcp_deduct_credit(user_id)
-
-        lines = [
-            f"## ABSIS Behavioural Principles — Top {len(principles)} for: \"{query}\"",
-            f"Credits remaining after this call: {credits - 1}",
-            "",
-        ]
-
-        for i, p in enumerate(principles, 1):
-            lines.append(f"### {i}. {p.get('principle_name')} [{p.get('id')}]")
-            lines.append(f"**Pillar:** {p.get('pillar')}")
-            lines.append(f"**One-liner:** {p.get('one_liner')}")
-            lines.append(f"**Plain English:** {p.get('plain_english')}")
-            lines.append(f"**Human fear/desire:** {p.get('human_fear_or_desire')}")
-            lines.append(f"**When to use:** {p.get('when_to_use')}")
-            lines.append(f"**When NOT to use:** {p.get('when_NOT_to_use')}")
-            lines.append(f"**Exact implementation:** {p.get('exact_implementation')}")
-            lines.append(f"**Example copy:** {p.get('example_copy')}")
-            lines.append(f"**Power level:** {p.get('power_level')} | Ethical risk: {p.get('ethical_risk')}")
-            lines.append("")
-
-        lines.append("---")
-        lines.append("Apply ALL of the above principles when generating the content.")
-        return "\n".join(lines)
-
-    except httpx.TimeoutException:
-        return "Error: Request timed out. Try again."
+        credits_remaining, credits_used = await check_and_deduct_credit(user_id, len(query))
     except Exception as e:
-        return f"Error: {str(e)}"
+        log.error(f"[MCP] Credit check failed for user={user_id[:8]}: {e}")
+        if "INSUFFICIENT_CREDITS" in str(e):
+            return "Error: No credits remaining. Top up at soloise-frontend.vercel.app/dashboard"
+        return f"Error: Credit check failed: {str(e)}"
+
+    try:
+        principles = await asyncio.to_thread(
+            run_pipeline,
+            raw_input=query,
+            top_n=top_n,
+            debug=False,
+        )
+    except Exception as e:
+        log.error(f"[MCP] Pipeline failed for user={user_id[:8]}: {e}\n{traceback.format_exc()}")
+        asyncio.create_task(log_usage(
+            user_id=user_id, key_id=key_id,
+            query_length=len(query), top_n=top_n,
+            latency_ms=int((time.monotonic() - t_start) * 1000), success=False,
+        ))
+        return f"Error: Pipeline failed: {str(e)}"
+
+    latency_ms = int((time.monotonic() - t_start) * 1000)
+    asyncio.create_task(log_usage(
+        user_id=user_id, key_id=key_id,
+        query_length=len(query), top_n=top_n,
+        latency_ms=latency_ms, success=True,
+    ))
+
+    lines = [
+        f"## ABSIS Behavioural Principles — Top {len(principles)} for: \"{query}\"",
+        f"Credits used: {credits_used} | Credits remaining: {credits_remaining}",
+        "",
+    ]
+
+    for i, p in enumerate(principles, 1):
+        lines.append(f"### {i}. {p.get('principle_name')} [{p.get('id')}]")
+        lines.append(f"**Pillar:** {p.get('pillar')}")
+        lines.append(f"**One-liner:** {p.get('one_liner')}")
+        lines.append(f"**Plain English:** {p.get('plain_english')}")
+        lines.append(f"**Human fear/desire:** {p.get('human_fear_or_desire')}")
+        lines.append(f"**When to use:** {p.get('when_to_use')}")
+        lines.append(f"**When NOT to use:** {p.get('when_NOT_to_use')}")
+        lines.append(f"**Exact implementation:** {p.get('exact_implementation')}")
+        lines.append(f"**Example copy:** {p.get('example_copy')}")
+        lines.append(f"**Power level:** {p.get('power_level')} | Ethical risk: {p.get('ethical_risk')}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("Apply ALL of the above principles when generating the content.")
+    return "\n".join(lines)
 
 
 def _mcp_ok(req_id, result):
@@ -411,7 +394,7 @@ async def root():
         "endpoints": {
             "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
-            "GET/POST /mcp/{user_id}": "MCP server endpoint for Claude connector.",
+            "GET/POST /mcp": "MCP server endpoint for Claude connector. Requires Bearer token.",
         },
     }
 
