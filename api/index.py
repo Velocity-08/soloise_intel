@@ -180,7 +180,12 @@ async def health():
 
 SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+# NOTE: Vercel project only has SUPABASE_SERVICE_ROLE_KEY set (confirmed via
+# `vercel env ls`) — there is no separate SUPABASE_KEY. Using the service role
+# key here is also correct for this use case: this endpoint reads/writes
+# credit_balances for arbitrary user_ids server-side, which requires bypassing
+# RLS. Keeping SUPABASE_KEY as a fallback in case it's ever added later.
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
 SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
 
 MCP_TOOLS = [
