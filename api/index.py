@@ -29,6 +29,25 @@ the handler calls run_pipeline() directly in-process (no self-HTTP-call, no
 master key) and deducts credits via the same check_and_deduct_credit() that
 /recommend uses — same cost formula, one credit ledger, one identity check.
 ──────────────────────────────────────────────────────────────────────────────
+ROUTING FIX (this revision):
+Claude's MCP connector calls the URL configured at connector-setup time, which
+includes a per-connector UUID as a trailing path segment, e.g.
+    POST /mcp/eb39351a-0abe-4492-b427-e0618df34586
+The old routes were registered as exactly "/mcp" with no path param, so that
+request matched no route for POST — it only structurally matched the
+"/{path:path}" OPTIONS catch-all below, which doesn't allow POST. Starlette's
+router sees a path match with no method match and returns 405 Method Not
+Allowed, without ever entering the handler (confirmed via Vercel logs: 10ms
+duration, "No outgoing requests").
+
+Fix: both /mcp routes now also accept an optional trailing /{connector_id}
+segment. connector_id is accepted but intentionally unused for auth/identity —
+identity still comes entirely from validate_api_key (Authorization: Bearer
+sk-sol-...), exactly as before. This means both of these now resolve to the
+same handlers:
+    POST /mcp
+    POST /mcp/eb39351a-0abe-4492-b427-e0618df34586
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -38,6 +57,7 @@ import uuid
 import logging
 import asyncio
 import traceback
+from typing import Optional
 
 # Ensure the api/ directory is on the path so all local modules resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -190,6 +210,11 @@ async def health():
 # header is required and validated via validate_api_key — same dependency,
 # same api_keys table lookup, same is_active check. No user_id in the URL,
 # no master key, no second credit ledger.
+#
+# Routing: both GET and POST accept either "/mcp" or "/mcp/{connector_id}".
+# connector_id is accepted purely so Claude's connector URL (which includes
+# a trailing UUID) resolves to a real route instead of 405ing. It is never
+# used for identity or auth — see ROUTING FIX note at the top of this file.
 # ══════════════════════════════════════════════════════════════════════════
 
 MCP_TOOLS = [
@@ -231,17 +256,24 @@ MCP_TOOLS = [
 
 
 @app.get("/mcp")
-async def mcp_probe():
+@app.get("/mcp/{connector_id}")
+async def mcp_probe(connector_id: Optional[str] = None):
     """Claude sends a GET first to check if the server is alive. Must return 200, not 405."""
     return JSONResponse(content={"status": "ok", "server": "soloise-absis"})
 
 
 @app.post("/mcp")
-async def mcp_handler(request: Request, key_row: dict = Depends(validate_api_key)):
+@app.post("/mcp/{connector_id}")
+async def mcp_handler(
+    request: Request,
+    connector_id: Optional[str] = None,
+    key_row: dict = Depends(validate_api_key),
+):
     """
     Single MCP endpoint for all authenticated users.
     Identity comes entirely from validate_api_key (Authorization: Bearer sk-sol-...),
-    exactly like /recommend. No user_id path param, no master key.
+    exactly like /recommend. connector_id (if present in the URL) is accepted but
+    unused — no user_id path param, no master key, no per-connector branching.
     """
     user_id = key_row["user_id"]
     key_id = key_row["id"]
@@ -395,6 +427,7 @@ async def root():
             "POST /recommend": "Get ranked principles. Requires Bearer token.",
             "GET /health": "Health check + dataset stats.",
             "GET/POST /mcp": "MCP server endpoint for Claude connector. Requires Bearer token.",
+            "GET/POST /mcp/{connector_id}": "Same as /mcp; connector_id is accepted but unused.",
         },
     }
 
