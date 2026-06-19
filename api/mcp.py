@@ -1,31 +1,29 @@
 """
-Soloise MCP Server — api/mcp.py
-Add this file to your Python backend (soloise-intel.vercel.app) in the api/ folder.
+Soloise MCP Server — api/mcp.py (FINAL)
+Fixes the Claude connector "Connection issue" error by properly
+handling Claude's OAuth discovery probes.
 
-URL pattern: POST /mcp/{user_id}
-- user_id is the Supabase auth user UUID (from the frontend)
-- Deducts from credit_balances (same credits as the API)
-- Uses your master Soloise key server-side
+Claude probes these before connecting:
+  GET /.well-known/oauth-protected-resource/mcp/{user_id}
+  GET /.well-known/oauth-protected-resource
+  GET /mcp/{user_id}  (with no body — must return 200, not 405)
 
-No new tables needed.
+We respond to all of them correctly so Claude knows:
+"this is a valid MCP server, no OAuth needed"
 """
 
 import os
-import hashlib
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from supabase import create_client
 from mangum import Mangum
 
-# ── Config (already set in your Vercel env) ───────────────────────────────────
 SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # service role key
-
-# The master sk-sol key — set this in your Vercel env vars
-# This is YOUR key, users never see it
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
+MCP_BASE_URL = "https://soloise-intel.vercel.app"
 
 TOOLS = [
     {
@@ -67,13 +65,46 @@ TOOLS = [
 app = FastAPI()
 
 
+# ── OAuth discovery endpoints — Claude probes these first ─────────────────────
+# Claude probes: GET /.well-known/oauth-protected-resource
+# and:           GET /.well-known/oauth-protected-resource/mcp/{user_id}
+# We respond with a valid document pointing to NO auth server,
+# which tells Claude this endpoint is public / no OAuth needed.
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/{rest:path}")
+async def oauth_metadata(rest: str = ""):
+    """
+    Return OAuth Protected Resource Metadata (RFC 9728).
+    By returning a valid document with an empty authorization_servers list,
+    we tell Claude: "this is a real MCP server but requires no OAuth".
+    """
+    return JSONResponse(content={
+        "resource": MCP_BASE_URL,
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+        "scopes_supported": [],
+    })
+
+
+# ── MCP endpoint — handles GET (Claude probe) + POST (actual calls) ───────────
+
+@app.get("/mcp/{user_id}")
+async def mcp_probe(user_id: str):
+    """
+    Claude sends a GET first to check if the server is alive.
+    Must return 200, not 405.
+    """
+    return JSONResponse(content={"status": "ok", "server": "soloise-absis"})
+
+
 @app.post("/mcp/{user_id}")
 async def mcp_handler(user_id: str, request: Request):
-    # 1. Validate user exists and has credits
+    # 1. Check user credits
     credits = await _get_credits(user_id)
     if credits is None:
         return _error(None, -32001,
-            "Invalid user ID. Get your MCP URL from your Soloise dashboard.")
+            "Invalid user ID. Get your MCP URL from your Soloise dashboard at soloise-frontend.vercel.app")
     if credits <= 0:
         return _error(None, -32002,
             "No credits remaining. Top up at soloise-frontend.vercel.app/dashboard")
@@ -119,10 +150,9 @@ async def mcp_handler(user_id: str, request: Request):
         return _error(req_id, -32601, f"Method not found: {method}")
 
 
-# ── Credit check ──────────────────────────────────────────────────────────────
+# ── Credit helpers ────────────────────────────────────────────────────────────
 
 async def _get_credits(user_id: str) -> int | None:
-    """Returns credit balance for user, or None if user doesn't exist."""
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         result = (
@@ -141,10 +171,8 @@ async def _get_credits(user_id: str) -> int | None:
 
 
 def _deduct_credit(user_id: str):
-    """Deduct 1 credit from credit_balances — same table the API uses."""
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Use RPC if you have it, otherwise raw update
         supabase.rpc("decrement_credits", {"uid": user_id}).execute()
     except Exception as e:
         print(f"[CREDIT DEDUCT ERROR] {e}")
@@ -159,7 +187,7 @@ async def _get_principles(args: dict, user_id: str, credits: int) -> str:
     if not query:
         return "Error: query cannot be empty."
     if not SOLOISE_MASTER_KEY:
-        return "Error: Server misconfigured. Contact support@soloise.com"
+        return "Error: Server misconfigured. Contact support."
 
     try:
         async with httpx.AsyncClient(timeout=35.0) as client:
@@ -180,7 +208,6 @@ async def _get_principles(args: dict, user_id: str, credits: int) -> str:
         data = resp.json()
         principles = data.get("results", [])
 
-        # Deduct credit after successful call
         _deduct_credit(user_id)
 
         lines = [
