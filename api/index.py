@@ -283,7 +283,7 @@ async def _mcp_get_credits(user_id: str):
             supabase.table("credit_balances")
             .select("credits")
             .eq("user_id", user_id)
-            .maybeSingle()
+            .maybe_single()
             .execute()
         )
         if result.data is None:
