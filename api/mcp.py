@@ -1,21 +1,25 @@
 """
-Soloise MCP Server — api/mcp.py (FINAL)
-Fixes the Claude connector "Connection issue" error by properly
-handling Claude's OAuth discovery probes.
+Soloise MCP Server — api/mcp.py (FIXED)
 
-Claude probes these before connecting:
-  GET /.well-known/oauth-protected-resource/mcp/{user_id}
-  GET /.well-known/oauth-protected-resource
-  GET /mcp/{user_id}  (with no body — must return 200, not 405)
+Root cause of the "Connection issue / Couldn't register with sign-in service" error:
+This server was serving a 200 response at /.well-known/oauth-protected-resource
+with an empty authorization_servers list. Claude's connector treats *any* 200
+response there as "this server requires OAuth — here is its metadata," then tries
+to discover/register a client against the (empty) authorization_servers list,
+which fails with the exact "Couldn't register with sign-in service" error.
 
-We respond to all of them correctly so Claude knows:
-"this is a valid MCP server, no OAuth needed"
+The correct way to say "no OAuth needed" is to NOT serve that endpoint at all
+(let it 404). Claude only starts the OAuth discovery flow when it receives a
+401 from the MCP endpoint itself, or finds real metadata via .well-known.
+An authless server should just answer MCP calls directly.
+
+We've removed the .well-known route entirely.
 """
 
 import os
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from supabase import create_client
 from mangum import Mangum
 
@@ -23,7 +27,6 @@ SOLOISE_BASE_URL = "https://soloise-intel.vercel.app"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SOLOISE_MASTER_KEY = os.environ.get("SOLOISE_MASTER_API_KEY", "")
-MCP_BASE_URL = "https://soloise-intel.vercel.app"
 
 TOOLS = [
     {
@@ -65,29 +68,11 @@ TOOLS = [
 app = FastAPI()
 
 
-# ── OAuth discovery endpoints — Claude probes these first ─────────────────────
-# Claude probes: GET /.well-known/oauth-protected-resource
-# and:           GET /.well-known/oauth-protected-resource/mcp/{user_id}
-# We respond with a valid document pointing to NO auth server,
-# which tells Claude this endpoint is public / no OAuth needed.
-
-@app.get("/.well-known/oauth-protected-resource")
-@app.get("/.well-known/oauth-protected-resource/{rest:path}")
-async def oauth_metadata(rest: str = ""):
-    """
-    Return OAuth Protected Resource Metadata (RFC 9728).
-    By returning a valid document with an empty authorization_servers list,
-    we tell Claude: "this is a real MCP server but requires no OAuth".
-    """
-    return JSONResponse(content={
-        "resource": MCP_BASE_URL,
-        "authorization_servers": [],
-        "bearer_methods_supported": [],
-        "scopes_supported": [],
-    })
-
-
-# ── MCP endpoint — handles GET (Claude probe) + POST (actual calls) ───────────
+# ── MCP endpoint — handles GET (Claude liveness probe) + POST (actual calls) ──
+# NOTE: deliberately NO /.well-known/oauth-protected-resource route.
+# Letting that 404 is what tells Claude "this server is authless" — see header
+# comment above. Do not re-add it unless you are actually implementing OAuth
+# with a real authorization_servers list.
 
 @app.get("/mcp/{user_id}")
 async def mcp_probe(user_id: str):
